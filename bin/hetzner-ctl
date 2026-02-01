@@ -22,6 +22,7 @@
 #   create-firewall <name> <ports> [--outbound <ports>]  Create firewall
 #   apply-firewall <fw-id> <srv-id> Apply firewall to a server
 #   get-firewall <id|name>  Show firewall rules
+#   update-firewall <id|name> [options]  Update firewall rules
 #   delete-firewall <id>            Delete a firewall
 #
 #   get-costs          Show current costs
@@ -764,6 +765,26 @@ cmd_delete_firewall() {
     echo -e "${GREEN}Firewall deleted${NC}"
 }
 
+# Resolve firewall by ID or name, sets FW_ID and FW_DATA
+resolve_firewall() {
+    local fw_ref=$1
+
+    if [[ "$fw_ref" =~ ^[0-9]+$ ]]; then
+        FW_DATA=$(api GET "/firewalls/$fw_ref")
+    else
+        local list_response
+        list_response=$(api GET "/firewalls?name=$fw_ref")
+        FW_DATA=$(echo "$list_response" | jq '{firewall: .firewalls[0]}')
+    fi
+
+    FW_ID=$(echo "$FW_DATA" | jq -r '.firewall.id // empty')
+
+    if [[ -z "$FW_ID" ]]; then
+        echo -e "${RED}Error: Firewall not found: $fw_ref${NC}"
+        exit 1
+    fi
+}
+
 cmd_get_firewall() {
     local fw_ref=${1:-}
 
@@ -773,35 +794,20 @@ cmd_get_firewall() {
         exit 1
     fi
 
-    # Try by ID first, then by name
-    local response
-    if [[ "$fw_ref" =~ ^[0-9]+$ ]]; then
-        response=$(api GET "/firewalls/$fw_ref")
-    else
-        response=$(api GET "/firewalls?name=$fw_ref")
-        response=$(echo "$response" | jq '{firewall: .firewalls[0]}')
-    fi
+    resolve_firewall "$fw_ref"
+    local fw_name
+    fw_name=$(echo "$FW_DATA" | jq -r '.firewall.name')
 
-    local fw_name fw_id
-    fw_name=$(echo "$response" | jq -r '.firewall.name // empty')
-
-    if [[ -z "$fw_name" ]]; then
-        echo -e "${RED}Error: Firewall not found: $fw_ref${NC}"
-        exit 1
-    fi
-
-    fw_id=$(echo "$response" | jq -r '.firewall.id')
-
-    echo -e "${CYAN}=== Firewall: $fw_name (ID: $fw_id) ===${NC}"
+    echo -e "${CYAN}=== Firewall: $fw_name (ID: $FW_ID) ===${NC}"
 
     local applied_count
-    applied_count=$(echo "$response" | jq '.firewall.applied_to | length')
+    applied_count=$(echo "$FW_DATA" | jq '.firewall.applied_to | length')
     echo -e "Applied to: $applied_count server(s)"
 
     echo ""
     echo -e "${BLUE}Inbound Rules:${NC}"
     local in_rules
-    in_rules=$(echo "$response" | jq -r '.firewall.rules[] | select(.direction == "in") | "\(.protocol)\t\(.port // "-")\t\(.source_ips | join(","))\t\(.description // "-")"')
+    in_rules=$(echo "$FW_DATA" | jq -r '.firewall.rules[] | select(.direction == "in") | "\(.protocol)\t\(.port // "-")\t\(.source_ips | join(","))\t\(.description // "-")"')
     if [[ -z "$in_rules" ]]; then
         echo "  (none — all inbound traffic denied)"
     else
@@ -811,12 +817,161 @@ cmd_get_firewall() {
     echo ""
     echo -e "${BLUE}Outbound Rules:${NC}"
     local out_rules
-    out_rules=$(echo "$response" | jq -r '.firewall.rules[] | select(.direction == "out") | "\(.protocol)\t\(.port // "-")\t\(.destination_ips | join(","))\t\(.description // "-")"')
+    out_rules=$(echo "$FW_DATA" | jq -r '.firewall.rules[] | select(.direction == "out") | "\(.protocol)\t\(.port // "-")\t\(.destination_ips | join(","))\t\(.description // "-")"')
     if [[ -z "$out_rules" ]]; then
         echo "  (none — all outbound traffic allowed)"
     else
         echo "$out_rules" | column -t -s $'\t' -N "PROTO,PORT,DESTINATION,DESC"
     fi
+}
+
+# Pipe existing rules JSON, append new port rules, output updated JSON
+# Usage: echo "$rules_json" | _build_rules_json "80,443,53/udp" "in" "source_ips"
+_build_rules_json() {
+    local port_csv=$1
+    local direction=$2
+    local ip_field=$3
+
+    local existing
+    existing=$(cat)
+
+    IFS=',' read -ra port_list <<< "$port_csv"
+    for port_spec in "${port_list[@]}"; do
+        local port protocol="tcp"
+        if [[ "$port_spec" == */udp ]]; then
+            protocol="udp"
+            port="${port_spec%/udp}"
+        elif [[ "$port_spec" == */tcp ]]; then
+            port="${port_spec%/tcp}"
+        else
+            port="$port_spec"
+        fi
+
+        existing=$(echo "$existing" | jq \
+            --arg dir "$direction" \
+            --arg proto "$protocol" \
+            --arg p "$port" \
+            --arg ipf "$ip_field" \
+            --arg desc "$direction $port/$protocol" \
+            '. + [{"direction": $dir, "protocol": $proto, "port": $p, ($ipf): ["0.0.0.0/0", "::/0"], "description": $desc}]')
+    done
+
+    echo "$existing"
+}
+
+cmd_update_firewall() {
+    local fw_ref=""
+    local add_inbound="" add_outbound="" remove_ports=""
+    local set_inbound="" set_outbound=""
+    local mode=""  # "merge" or "replace"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --add-inbound)   add_inbound="$2"; mode="merge"; shift 2 ;;
+            --add-outbound)  add_outbound="$2"; mode="merge"; shift 2 ;;
+            --remove)        remove_ports="$2"; mode="merge"; shift 2 ;;
+            --set-inbound)   set_inbound="$2"; mode="replace"; shift 2 ;;
+            --set-outbound)  set_outbound="$2"; mode="replace"; shift 2 ;;
+            *)
+                if [[ -z "$fw_ref" ]]; then
+                    fw_ref="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$fw_ref" ]]; then
+        echo -e "${RED}Error: Firewall ID or name required${NC}"
+        echo "Usage: $0 update-firewall <id-or-name> [options]"
+        echo ""
+        echo "Merge mode (adds to / removes from existing rules):"
+        echo "  --add-inbound <ports>   Add inbound rules"
+        echo "  --add-outbound <ports>  Add outbound rules"
+        echo "  --remove <ports>        Remove rules matching these ports"
+        echo ""
+        echo "Replace mode (replaces all rules):"
+        echo "  --set-inbound <ports>   Set all inbound rules"
+        echo "  --set-outbound <ports>  Set all outbound rules"
+        exit 1
+    fi
+
+    if [[ -z "$mode" ]]; then
+        echo -e "${RED}Error: At least one of --add-inbound, --add-outbound, --remove, --set-inbound, --set-outbound required${NC}"
+        exit 1
+    fi
+
+    resolve_firewall "$fw_ref"
+    local fw_name
+    fw_name=$(echo "$FW_DATA" | jq -r '.firewall.name')
+
+    local rules
+
+    if [[ "$mode" == "replace" ]]; then
+        # Build fresh rule set
+        rules="[]"
+
+        if [[ -n "$set_inbound" ]]; then
+            rules=$(echo "$rules" | _build_rules_json "$set_inbound" "in" "source_ips")
+        fi
+        if [[ -n "$set_outbound" ]]; then
+            rules=$(echo "$rules" | _build_rules_json "$set_outbound" "out" "destination_ips")
+        fi
+
+        # Add ICMP
+        rules=$(echo "$rules" | jq '. + [{"direction":"in","protocol":"icmp","source_ips":["0.0.0.0/0","::/0"],"description":"ICMP"}]')
+
+    else
+        # Merge mode: start from existing rules
+        rules=$(echo "$FW_DATA" | jq '.firewall.rules')
+
+        if [[ -n "$remove_ports" ]]; then
+            IFS=',' read -ra remove_list <<< "$remove_ports"
+            for port_spec in "${remove_list[@]}"; do
+                local port protocol="tcp"
+                if [[ "$port_spec" == */udp ]]; then
+                    protocol="udp"
+                    port="${port_spec%/udp}"
+                elif [[ "$port_spec" == */tcp ]]; then
+                    port="${port_spec%/tcp}"
+                else
+                    port="$port_spec"
+                fi
+                rules=$(echo "$rules" | jq --arg p "$port" --arg pr "$protocol" '[.[] | select(.port != $p or .protocol != $pr)]')
+            done
+        fi
+
+        if [[ -n "$add_inbound" ]]; then
+            rules=$(echo "$rules" | _build_rules_json "$add_inbound" "in" "source_ips")
+        fi
+        if [[ -n "$add_outbound" ]]; then
+            rules=$(echo "$rules" | _build_rules_json "$add_outbound" "out" "destination_ips")
+        fi
+    fi
+
+    local rule_count
+    rule_count=$(echo "$rules" | jq 'length')
+
+    echo "Updating firewall '$fw_name' (ID: $FW_ID) with $rule_count rules:"
+    echo "$rules" | jq -r '.[] | "  \(.direction) \(.protocol) \(.port // "-")"'
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api POST "/firewalls/$FW_ID/actions/set_rules" "{\"rules\": $rules}")
+
+    local action_status
+    action_status=$(echo "$response" | jq -r '.actions[0].status // "unknown"')
+
+    if [[ "$action_status" == "error" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.actions[0].error.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Firewall updated${NC}"
 }
 
 # Main
@@ -848,6 +1003,7 @@ main() {
         apply-firewall)  cmd_apply_firewall "${2:-}" "${3:-}" ;;
         delete-firewall) cmd_delete_firewall "${2:-}" ;;
         get-firewall)    cmd_get_firewall "${2:-}" ;;
+        update-firewall) shift; cmd_update_firewall "$@" ;;
         get-costs)       cmd_get_costs ;;
         ssh)             shift; cmd_ssh "$@" ;;
         status)          cmd_status "${2:-}" ;;
