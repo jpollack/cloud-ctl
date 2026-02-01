@@ -25,6 +25,11 @@
 #   update-firewall <id|name> [options]  Update firewall rules
 #   delete-firewall <id>            Delete a firewall
 #
+#   list-networks              List all networks
+#   get-network <id>           Get network details
+#   create-network <name> <ip-range>  Create a network
+#   delete-network <id>        Delete a network
+#
 #   get-costs          Show current costs
 #
 #   ssh <name> [cmd]   SSH into server by name, optionally run command
@@ -974,6 +979,135 @@ cmd_update_firewall() {
     echo -e "${GREEN}Firewall updated${NC}"
 }
 
+# Network commands
+
+cmd_list_networks() {
+    echo -e "${CYAN}=== Networks ===${NC}"
+    local response
+    response=$(api GET "/networks")
+
+    local count
+    count=$(echo "$response" | jq '.networks | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo "No networks found"
+        return
+    fi
+
+    echo "$response" | jq -r '.networks[] | "\(.id)\t\(.name)\t\(.ip_range)\t\(.subnets | length) subnets\t\(.servers | length) servers"' | \
+        column -t -s $'\t' -N "ID,NAME,IP_RANGE,SUBNETS,SERVERS"
+}
+
+cmd_get_network() {
+    local net_id=${1:-}
+
+    if [[ -z "$net_id" ]]; then
+        echo -e "${RED}Error: Network ID required${NC}"
+        echo "Usage: $0 get-network <id>"
+        exit 1
+    fi
+
+    local response
+    response=$(api GET "/networks/$net_id")
+
+    local net_name ip_range
+    net_name=$(echo "$response" | jq -r '.network.name // empty')
+
+    if [[ -z "$net_name" ]]; then
+        echo -e "${RED}Error: Network not found: $net_id${NC}"
+        exit 1
+    fi
+
+    ip_range=$(echo "$response" | jq -r '.network.ip_range')
+
+    echo -e "${CYAN}=== Network: $net_name (ID: $net_id) ===${NC}"
+    echo -e "IP Range: $ip_range"
+
+    echo ""
+    echo -e "${BLUE}Subnets:${NC}"
+    local subnets
+    subnets=$(echo "$response" | jq -r '.network.subnets[] | "\(.ip_range)\t\(.type)\t\(.network_zone)"')
+    if [[ -z "$subnets" ]]; then
+        echo "  (none)"
+    else
+        echo "$subnets" | column -t -s $'\t' -N "IP_RANGE,TYPE,ZONE"
+    fi
+
+    echo ""
+    echo -e "${BLUE}Servers:${NC}"
+    local servers
+    servers=$(echo "$response" | jq -r '.network.servers[]' 2>/dev/null)
+    if [[ -z "$servers" ]]; then
+        echo "  (none)"
+    else
+        for srv_id in $servers; do
+            local srv_info
+            srv_info=$(api GET "/servers/$srv_id")
+            local srv_name srv_ip
+            srv_name=$(echo "$srv_info" | jq -r '.server.name')
+            srv_ip=$(echo "$srv_info" | jq -r ".server.private_net[] | select(.network == $net_id) | .ip")
+            echo "  $srv_id  $srv_name  $srv_ip"
+        done
+    fi
+}
+
+cmd_create_network() {
+    local name=${1:-}
+    local ip_range=${2:-}
+
+    if [[ -z "$name" || -z "$ip_range" ]]; then
+        echo -e "${RED}Error: Name and IP range required${NC}"
+        echo "Usage: $0 create-network <name> <ip-range>"
+        echo "Example: $0 create-network my-net 10.0.0.0/16"
+        exit 1
+    fi
+
+    echo "Creating network '$name' with range $ip_range"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api POST "/networks" "{\"name\": \"$name\", \"ip_range\": \"$ip_range\"}")
+
+    local net_id
+    net_id=$(echo "$response" | jq -r '.network.id')
+
+    if [[ -z "$net_id" || "$net_id" == "null" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.error.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Network created: $net_id${NC}"
+}
+
+cmd_delete_network() {
+    local net_id=${1:-}
+
+    if [[ -z "$net_id" ]]; then
+        echo -e "${RED}Error: Network ID required${NC}"
+        echo "Usage: $0 delete-network <id>"
+        exit 1
+    fi
+
+    local net_info
+    net_info=$(api GET "/networks/$net_id")
+    local net_name
+    net_name=$(echo "$net_info" | jq -r '.network.name')
+
+    echo -e "${YELLOW}Deleting network '$net_name' (ID: $net_id)${NC}"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    api DELETE "/networks/$net_id" > /dev/null
+    echo -e "${GREEN}Network deleted${NC}"
+}
+
 # Main
 main() {
     parse_global_flags "$@"
@@ -1004,6 +1138,10 @@ main() {
         delete-firewall) cmd_delete_firewall "${2:-}" ;;
         get-firewall)    cmd_get_firewall "${2:-}" ;;
         update-firewall) shift; cmd_update_firewall "$@" ;;
+        list-networks)   cmd_list_networks ;;
+        get-network)     cmd_get_network "${2:-}" ;;
+        create-network)  cmd_create_network "${2:-}" "${3:-}" ;;
+        delete-network)  cmd_delete_network "${2:-}" ;;
         get-costs)       cmd_get_costs ;;
         ssh)             shift; cmd_ssh "$@" ;;
         status)          cmd_status "${2:-}" ;;
