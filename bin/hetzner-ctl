@@ -31,6 +31,8 @@
 #   delete-network <id>        Delete a network
 #   add-subnet <net-id> <ip-range> [zone]  Add subnet to network
 #   delete-subnet <net-id> <ip-range>      Remove subnet from network
+#   attach-network <srv-id> <net-id> [ip]  Attach server to network
+#   detach-network <srv-id> <net-id>        Detach server from network
 #
 #   get-costs          Show current costs
 #
@@ -158,6 +160,8 @@ cmd_list_all() {
     cmd_list_firewalls
     echo ""
     cmd_list_ssh_keys
+    echo ""
+    cmd_list_networks
 }
 
 cmd_get_server() {
@@ -1177,6 +1181,75 @@ cmd_delete_subnet() {
     echo -e "${GREEN}Subnet removed${NC}"
 }
 
+cmd_attach_network() {
+    local server_id=${1:-}
+    local net_id=${2:-}
+    local ip=${3:-}
+
+    if [[ -z "$server_id" || -z "$net_id" ]]; then
+        echo -e "${RED}Error: Server ID and network ID required${NC}"
+        echo "Usage: $0 attach-network <server-id> <network-id> [ip]"
+        exit 1
+    fi
+
+    local payload="{\"network\": $net_id"
+    if [[ -n "$ip" ]]; then
+        payload+=", \"ip\": \"$ip\""
+    fi
+    payload+="}"
+
+    echo "Attaching server $server_id to network $net_id${ip:+ with IP $ip}"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api POST "/servers/$server_id/actions/attach_to_network" "$payload")
+
+    local action_status
+    action_status=$(echo "$response" | jq -r '.action.status // "unknown"')
+
+    if [[ "$action_status" == "error" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.action.error.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Server attached to network${NC}"
+}
+
+cmd_detach_network() {
+    local server_id=${1:-}
+    local net_id=${2:-}
+
+    if [[ -z "$server_id" || -z "$net_id" ]]; then
+        echo -e "${RED}Error: Server ID and network ID required${NC}"
+        echo "Usage: $0 detach-network <server-id> <network-id>"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}Detaching server $server_id from network $net_id${NC}"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api POST "/servers/$server_id/actions/detach_from_network" "{\"network\": $net_id}")
+
+    local action_status
+    action_status=$(echo "$response" | jq -r '.action.status // "unknown"')
+
+    if [[ "$action_status" == "error" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.action.error.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Server detached from network${NC}"
+}
+
 # Main
 main() {
     parse_global_flags "$@"
@@ -1213,6 +1286,8 @@ main() {
         delete-network)  cmd_delete_network "${2:-}" ;;
         add-subnet)      cmd_add_subnet "${2:-}" "${3:-}" "${4:-}" ;;
         delete-subnet)   cmd_delete_subnet "${2:-}" "${3:-}" ;;
+        attach-network)  cmd_attach_network "${2:-}" "${3:-}" "${4:-}" ;;
+        detach-network)  cmd_detach_network "${2:-}" "${3:-}" ;;
         get-costs)       cmd_get_costs ;;
         ssh)             shift; cmd_ssh "$@" ;;
         status)          cmd_status "${2:-}" ;;
