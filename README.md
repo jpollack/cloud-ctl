@@ -9,7 +9,7 @@ Standalone CLI tools for managing cloud infrastructure.
 | `hetzner-ctl` | Hetzner Cloud | Servers, firewalls, SSH keys, costs |
 | `oracle-ctl` | Oracle Cloud | Instances, VCNs, security lists, free-tier limits |
 | `porkbun-ctl` | Porkbun | Domain registration, DNS records, nameservers |
-| `server-ctl` | (any Linux) | Docker, UFW, SSH hardening, auto-updates |
+| `setup-server` | (any Linux) | Docker, UFW, SSH hardening, auto-updates |
 
 ## Install
 
@@ -44,8 +44,8 @@ porkbun-ctl search mysite
 porkbun-ctl register mysite.xyz
 porkbun-ctl set-a mysite.xyz @ 1.2.3.4
 
-# Server setup (run on target server)
-server-ctl setup --ports 22,80,443,10000/udp
+# Server setup (runs over SSH)
+setup-server 1.2.3.4 --ports 22,80,443,10000/udp
 ```
 
 Run any tool with `--help` for full command list.

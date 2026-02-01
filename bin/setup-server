@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+#
+# setup-server — Harden a freshly provisioned VPS over SSH
+#
+# Usage: setup-server <ip> [options]
+#
+# Options:
+#   --ports 22,80,443    Ports to allow through UFW (default: 22,80,443)
+#   --timezone UTC       Timezone to set (default: UTC)
+#   -y, --yes            Skip confirmation prompts
+#
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+FORCE_YES=false
+DEFAULT_PORTS="22,80,443"
+DEFAULT_TIMEZONE="UTC"
+
+usage() {
+    sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
+    exit 1
+}
+
+confirm_action() {
+    local prompt=${1:-"Proceed?"}
+    if [[ "$FORCE_YES" == "true" ]]; then
+        return 0
+    fi
+    read -p "$prompt [y/N]: " confirm
+    [[ "$confirm" == "y" || "$confirm" == "Y" ]]
+}
+
+main() {
+    local ip="" ports="$DEFAULT_PORTS" timezone="$DEFAULT_TIMEZONE"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)    FORCE_YES=true; shift ;;
+            --ports)     ports="$2"; shift 2 ;;
+            --timezone)  timezone="$2"; shift 2 ;;
+            -h|--help)   usage ;;
+            -*)          echo -e "${RED}Unknown option: $1${NC}" >&2; exit 1 ;;
+            *)
+                if [[ -z "$ip" ]]; then
+                    ip="$1"; shift
+                else
+                    echo -e "${RED}Unexpected argument: $1${NC}" >&2; exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$ip" ]]; then
+        echo -e "${RED}Error: IP address required${NC}" >&2
+        usage
+    fi
+
+    echo -e "${CYAN}=== Server Setup ===${NC}"
+    echo "  Host:     $ip"
+    echo "  Ports:    $ports"
+    echo "  Timezone: $timezone"
+    echo ""
+
+    if ! confirm_action "Proceed with full server setup?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    echo "Connecting to root@${ip}..."
+    # shellcheck disable=SC2087
+    ssh -o StrictHostKeyChecking=accept-new "root@${ip}" bash -s <<REMOTE
+set -euo pipefail
+
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+log_info() { echo -e "\${BLUE}[INFO]\${NC} \$*"; }
+log_success() { echo -e "\${GREEN}[OK]\${NC} \$*"; }
+
+# --- Docker ---
+log_info "Installing essential packages..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y \
+    apt-transport-https ca-certificates curl gnupg lsb-release \
+    git htop vim jq
+
+log_info "Installing Docker..."
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker
+    systemctl start docker
+else
+    log_info "Docker already installed"
+fi
+
+log_info "Installing Docker Compose..."
+if ! docker compose version &> /dev/null; then
+    apt-get install -y docker-compose-plugin
+else
+    log_info "Docker Compose already installed"
+fi
+
+log_info "Configuring Docker DNS (avoid systemd-resolved stub)..."
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json << 'DNSEOF'
+{"dns": ["1.1.1.1", "8.8.8.8"]}
+DNSEOF
+systemctl restart docker
+
+log_success "Docker setup complete"
+docker --version
+docker compose version
+
+# --- UFW ---
+log_info "Configuring UFW firewall..."
+apt-get install -y ufw
+
+ufw default deny incoming
+ufw default allow outgoing
+
+IFS=',' read -ra port_list <<< "${ports}"
+for port_spec in "\${port_list[@]}"; do
+    port="\$port_spec" protocol=""
+    if [[ "\$port_spec" == */udp ]]; then
+        protocol="/udp"
+        port="\${port_spec%/udp}"
+    elif [[ "\$port_spec" == */tcp ]]; then
+        protocol="/tcp"
+        port="\${port_spec%/tcp}"
+    fi
+    log_info "Allowing port \${port}\${protocol}"
+    ufw allow "\${port}\${protocol}"
+done
+
+log_info "Setting UFW FORWARD policy to ACCEPT (required for Docker)"
+sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+
+ufw --force enable
+log_success "UFW configured"
+
+# --- SSH ---
+log_info "Hardening SSH configuration..."
+apt-get install -y fail2ban
+systemctl enable fail2ban
+systemctl start fail2ban
+
+if ! grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config; then
+    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+    sed -i 's/^#*X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
+    systemctl restart ssh || systemctl restart sshd
+fi
+
+passwd -l root
+
+log_success "SSH hardened"
+
+# --- Auto-updates ---
+log_info "Configuring automatic updates..."
+apt-get install -y unattended-upgrades apt-listchanges
+
+cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'UPGEOF'
+Unattended-Upgrade::Allowed-Origins {
+    "\${distro_id}:\${distro_codename}";
+    "\${distro_id}:\${distro_codename}-security";
+    "\${distro_id}:\${distro_codename}-updates";
+    "\${distro_id}ESMApps:\${distro_codename}-apps-security";
+    "\${distro_id}ESM:\${distro_codename}-infra-security";
+    "Docker:\${distro_codename}";
+};
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Mail "";
+Unattended-Upgrade::SyslogEnable "true";
+UPGEOF
+
+cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUTOEOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+AUTOEOF
+
+log_success "Automatic updates configured (auto-reboot at 3am UTC)"
+
+# --- Timezone & cleanup ---
+timedatectl set-timezone ${timezone}
+
+apt-get autoremove -y
+apt-get clean
+
+log_success "Server setup complete!"
+REMOTE
+}
+
+main "\$@"

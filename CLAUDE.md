@@ -11,7 +11,7 @@ Standalone CLI tools for managing cloud infrastructure across providers.
 | `hetzner-ctl` | Manage Hetzner Cloud servers, firewalls, SSH keys |
 | `oracle-ctl` | Manage Oracle Cloud instances, networks, security |
 | `porkbun-ctl` | Manage domains and DNS via Porkbun |
-| `server-ctl` | Generic server hardening (Docker, UFW, SSH, auto-updates) |
+| `setup-server` | Generic server hardening over SSH (Docker, UFW, SSH, auto-updates) |
 
 ## Structure
 
