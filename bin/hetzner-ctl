@@ -697,6 +697,11 @@ cmd_create_firewall() {
 
     # Always add ICMP inbound
     rules+=",{\"direction\":\"in\",\"protocol\":\"icmp\",\"source_ips\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"ICMP\"}"
+
+    # Outbound rules (Hetzner blocks all outbound by default if no outbound rules defined)
+    rules+=",{\"direction\":\"out\",\"protocol\":\"tcp\",\"port\":\"1-65535\",\"destination_ips\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"Outbound TCP\"}"
+    rules+=",{\"direction\":\"out\",\"protocol\":\"udp\",\"port\":\"1-65535\",\"destination_ips\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"Outbound UDP\"}"
+    rules+=",{\"direction\":\"out\",\"protocol\":\"icmp\",\"destination_ips\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"Outbound ICMP\"}"
     rules+="]"
 
     echo "Creating firewall '$name'"
