@@ -29,6 +29,8 @@
 #   get-network <id>           Get network details
 #   create-network <name> <ip-range>  Create a network
 #   delete-network <id>        Delete a network
+#   add-subnet <net-id> <ip-range> [zone]  Add subnet to network
+#   delete-subnet <net-id> <ip-range>      Remove subnet from network
 #
 #   get-costs          Show current costs
 #
@@ -1108,6 +1110,73 @@ cmd_delete_network() {
     echo -e "${GREEN}Network deleted${NC}"
 }
 
+cmd_add_subnet() {
+    local net_id=${1:-}
+    local ip_range=${2:-}
+    local zone=${3:-us-west}
+
+    if [[ -z "$net_id" || -z "$ip_range" ]]; then
+        echo -e "${RED}Error: Network ID and IP range required${NC}"
+        echo "Usage: $0 add-subnet <network-id> <ip-range> [zone]"
+        echo "Example: $0 add-subnet 123 10.0.1.0/24 us-west"
+        echo "Zones: us-west (default), us-east, eu-central, ap-southeast"
+        exit 1
+    fi
+
+    echo "Adding subnet $ip_range (zone: $zone) to network $net_id"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api POST "/networks/$net_id/actions/add_subnet" \
+        "{\"type\": \"server\", \"ip_range\": \"$ip_range\", \"network_zone\": \"$zone\"}")
+
+    local action_status
+    action_status=$(echo "$response" | jq -r '.action.status // "unknown"')
+
+    if [[ "$action_status" == "error" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.action.error.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Subnet added${NC}"
+}
+
+cmd_delete_subnet() {
+    local net_id=${1:-}
+    local ip_range=${2:-}
+
+    if [[ -z "$net_id" || -z "$ip_range" ]]; then
+        echo -e "${RED}Error: Network ID and subnet IP range required${NC}"
+        echo "Usage: $0 delete-subnet <network-id> <ip-range>"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}Removing subnet $ip_range from network $net_id${NC}"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api POST "/networks/$net_id/actions/delete_subnet" \
+        "{\"ip_range\": \"$ip_range\"}")
+
+    local action_status
+    action_status=$(echo "$response" | jq -r '.action.status // "unknown"')
+
+    if [[ "$action_status" == "error" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.action.error.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Subnet removed${NC}"
+}
+
 # Main
 main() {
     parse_global_flags "$@"
@@ -1142,6 +1211,8 @@ main() {
         get-network)     cmd_get_network "${2:-}" ;;
         create-network)  cmd_create_network "${2:-}" "${3:-}" ;;
         delete-network)  cmd_delete_network "${2:-}" ;;
+        add-subnet)      cmd_add_subnet "${2:-}" "${3:-}" "${4:-}" ;;
+        delete-subnet)   cmd_delete_subnet "${2:-}" "${3:-}" ;;
         get-costs)       cmd_get_costs ;;
         ssh)             shift; cmd_ssh "$@" ;;
         status)          cmd_status "${2:-}" ;;
