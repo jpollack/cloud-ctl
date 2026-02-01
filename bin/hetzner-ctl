@@ -912,6 +912,12 @@ cmd_update_firewall() {
         exit 1
     fi
 
+    # Prevent mixing merge and replace flags
+    if [[ -n "$set_inbound" || -n "$set_outbound" ]] && [[ -n "$add_inbound" || -n "$add_outbound" || -n "$remove_ports" ]]; then
+        echo -e "${RED}Error: Cannot mix --set-* flags with --add-*/--remove flags${NC}"
+        exit 1
+    fi
+
     resolve_firewall "$fw_ref"
     local fw_name
     fw_name=$(echo "$FW_DATA" | jq -r '.firewall.name')
