@@ -19,7 +19,7 @@
 #   create-server [name] [type] [image] [location] [ssh-key]  Create server
 #   delete-server <id> Delete a server
 #
-#   create-firewall <name> <ports>  Create firewall with specified ports
+#   create-firewall <name> <ports> [--outbound <ports>]  Create firewall
 #   apply-firewall <fw-id> <srv-id> Apply firewall to a server
 #   get-firewall <id|name>  Show firewall rules
 #   delete-firewall <id>            Delete a firewall
@@ -601,20 +601,38 @@ cmd_power_off() {
 # Firewall commands
 
 cmd_create_firewall() {
-    local name=${1:-}
-    local ports=${2:-}
+    local name="" ports="" outbound_ports=""
+
+    # Parse args: create-firewall <name> <ports> [--outbound <ports>]
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --outbound)
+                outbound_ports="${2:-}"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                elif [[ -z "$ports" ]]; then
+                    ports="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     if [[ -z "$name" ]]; then
         echo -e "${RED}Error: Firewall name required${NC}"
-        echo "Usage: $0 create-firewall <name> <ports>"
+        echo "Usage: $0 create-firewall <name> <ports> [--outbound <ports>]"
         echo "  ports: comma-separated, e.g. 22,80,443,10000/udp"
+        echo "  --outbound: comma-separated outbound ports"
         exit 1
     fi
 
     if [[ -z "$ports" ]]; then
-        echo -e "${RED}Error: Ports required${NC}"
-        echo "Usage: $0 create-firewall <name> <ports>"
-        echo "Example: $0 create-firewall my-fw 22,80,443,3478/udp,10000/udp"
+        echo -e "${RED}Error: Inbound ports required${NC}"
+        echo "Usage: $0 create-firewall <name> <ports> [--outbound <ports>]"
+        echo "Example: $0 create-firewall my-fw 22,80,443 --outbound 80,443,53/udp"
         exit 1
     fi
 
@@ -628,35 +646,52 @@ cmd_create_firewall() {
         return 0
     fi
 
-    # Build rules JSON from port list
+    # Build rules JSON
     local rules="["
     local first=true
 
-    IFS=',' read -ra port_list <<< "$ports"
-    for port_spec in "${port_list[@]}"; do
-        local port protocol="tcp"
-        if [[ "$port_spec" == */udp ]]; then
-            protocol="udp"
-            port="${port_spec%/udp}"
-        elif [[ "$port_spec" == */tcp ]]; then
-            port="${port_spec%/tcp}"
-        else
-            port="$port_spec"
-        fi
+    # Helper to add port rules
+    _add_port_rules() {
+        local port_csv=$1
+        local direction=$2  # "in" or "out"
+        local ip_field=$3   # "source_ips" or "destination_ips"
 
-        if [[ "$first" != "true" ]]; then
-            rules+=","
-        fi
-        first=false
+        IFS=',' read -ra port_list <<< "$port_csv"
+        for port_spec in "${port_list[@]}"; do
+            local port protocol="tcp"
+            if [[ "$port_spec" == */udp ]]; then
+                protocol="udp"
+                port="${port_spec%/udp}"
+            elif [[ "$port_spec" == */tcp ]]; then
+                port="${port_spec%/tcp}"
+            else
+                port="$port_spec"
+            fi
 
-        rules+="{\"direction\":\"in\",\"protocol\":\"$protocol\",\"port\":\"$port\",\"source_ips\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"$port/$protocol\"}"
-    done
+            if [[ "$first" != "true" ]]; then
+                rules+=","
+            fi
+            first=false
 
-    # Always add ICMP
+            rules+="{\"direction\":\"$direction\",\"protocol\":\"$protocol\",\"port\":\"$port\",\"$ip_field\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"$direction $port/$protocol\"}"
+        done
+    }
+
+    _add_port_rules "$ports" "in" "source_ips"
+
+    if [[ -n "$outbound_ports" ]]; then
+        _add_port_rules "$outbound_ports" "out" "destination_ips"
+    fi
+
+    # Always add ICMP inbound
     rules+=",{\"direction\":\"in\",\"protocol\":\"icmp\",\"source_ips\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"ICMP\"}"
     rules+="]"
 
-    echo "Creating firewall '$name' with ports: $ports"
+    echo "Creating firewall '$name'"
+    echo "  Inbound ports:  $ports"
+    if [[ -n "$outbound_ports" ]]; then
+        echo "  Outbound ports: $outbound_ports"
+    fi
 
     if ! confirm_action "Proceed?"; then
         echo "Cancelled"
@@ -809,7 +844,7 @@ main() {
         add-ssh-key)     cmd_add_ssh_key "${2:-}" "${3:-}" ;;
         create-server)   cmd_create_server "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
         delete-server)   cmd_delete_server "${2:-}" ;;
-        create-firewall) cmd_create_firewall "${2:-}" "${3:-}" ;;
+        create-firewall) shift; cmd_create_firewall "$@" ;;
         apply-firewall)  cmd_apply_firewall "${2:-}" "${3:-}" ;;
         delete-firewall) cmd_delete_firewall "${2:-}" ;;
         get-firewall)    cmd_get_firewall "${2:-}" ;;
