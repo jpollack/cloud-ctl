@@ -1,0 +1,774 @@
+#!/usr/bin/env bash
+#
+# Hetzner Cloud Management CLI
+# Simple primitives for managing Hetzner Cloud resources
+#
+# Usage: hetzner-ctl <command> [args...]
+#
+# Commands:
+#   list-servers       List all servers
+#   list-firewalls     List all firewalls
+#   list-ssh-keys      List all SSH keys
+#   list-images        List available images
+#   list-types         List server types (sizes)
+#   list-locations     List data center locations
+#   list-all           List all resources (servers, firewalls, keys)
+#
+#   get-server <id>    Get server details
+#   add-ssh-key [name] [keyfile]  Add SSH key (interactive or with args)
+#   create-server [name] [type] [image] [location] [ssh-key]  Create server
+#   delete-server <id> Delete a server
+#
+#   create-firewall <name> <ports>  Create firewall with specified ports
+#   apply-firewall <fw-id> <srv-id> Apply firewall to a server
+#   delete-firewall <id>            Delete a firewall
+#
+#   get-costs          Show current costs
+#
+#   ssh <name> [cmd]   SSH into server by name, optionally run command
+#   status <name>      Show server status, IP, and type
+#   console <id>       Get VNC console URL for a server
+#   reboot <id>        Reboot a server
+#   power-on <id>      Power on a server
+#   power-off <id>     Power off a server
+#
+# Options:
+#   -y, --yes          Skip confirmation prompts (for scripting)
+#
+# Environment:
+#   HETZNER_API_TOKEN  API token (or ~/.hetzner/api_token)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Load token
+load_token() {
+    if ! load_credential "HETZNER_API_TOKEN" "$HOME/.hetzner/api_token"; then
+        echo -e "${RED}Error: No API token found${NC}"
+        echo "Set HETZNER_API_TOKEN or create ~/.hetzner/api_token"
+        exit 1
+    fi
+}
+
+# API request helper
+api() {
+    local method=$1
+    local endpoint=$2
+    local data=${3:-}
+
+    local args=(
+        -s
+        -X "$method"
+        -H "Authorization: Bearer ${HETZNER_API_TOKEN}"
+        -H "Content-Type: application/json"
+    )
+
+    if [[ -n "$data" ]]; then
+        args+=(-d "$data")
+    fi
+
+    curl "${args[@]}" "https://api.hetzner.cloud/v1${endpoint}"
+}
+
+# Commands
+cmd_list_servers() {
+    echo -e "${CYAN}=== Servers ===${NC}"
+    local response
+    response=$(api GET "/servers")
+
+    local count
+    count=$(echo "$response" | jq '.servers | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo "No servers found"
+        return
+    fi
+
+    echo "$response" | jq -r '.servers[] | "\(.id)\t\(.name)\t\(.server_type.name)\t\(.status)\t\(.public_net.ipv4.ip // "no-ip")\t\(.datacenter.name)"' | \
+        column -t -s $'\t' -N "ID,NAME,TYPE,STATUS,IP,DATACENTER"
+}
+
+cmd_list_firewalls() {
+    echo -e "${CYAN}=== Firewalls ===${NC}"
+    local response
+    response=$(api GET "/firewalls")
+
+    local count
+    count=$(echo "$response" | jq '.firewalls | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo "No firewalls found"
+        return
+    fi
+
+    echo "$response" | jq -r '.firewalls[] | "\(.id)\t\(.name)\t\(.rules | length) rules\t\(.applied_to | length) servers"' | \
+        column -t -s $'\t' -N "ID,NAME,RULES,APPLIED_TO"
+}
+
+cmd_list_ssh_keys() {
+    echo -e "${CYAN}=== SSH Keys ===${NC}"
+    local response
+    response=$(api GET "/ssh_keys")
+
+    local count
+    count=$(echo "$response" | jq '.ssh_keys | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo "No SSH keys found"
+        return
+    fi
+
+    echo "$response" | jq -r '.ssh_keys[] | "\(.id)\t\(.name)\t\(.fingerprint)"' | \
+        column -t -s $'\t' -N "ID,NAME,FINGERPRINT"
+}
+
+cmd_list_images() {
+    echo -e "${CYAN}=== Available Images (Ubuntu/Debian) ===${NC}"
+    api GET "/images?type=system" | jq -r '.images[] | select(.os_flavor == "ubuntu" or .os_flavor == "debian") | "\(.id)\t\(.name)\t\(.os_flavor)\t\(.os_version)"' | \
+        column -t -s $'\t' -N "ID,NAME,OS,VERSION"
+}
+
+cmd_list_types() {
+    echo -e "${CYAN}=== Server Types ===${NC}"
+    api GET "/server_types" | jq -r '.server_types[] | select(.deprecated == false) | "\(.name)\t\(.cores) vCPU\t\(.memory) GB\t\(.disk) GB\t€\(.prices[0].price_monthly.gross | tonumber | . * 100 | floor / 100)/mo"' | \
+        sort -t$'\t' -k5 -n | \
+        column -t -s $'\t' -N "TYPE,CPU,RAM,DISK,PRICE"
+}
+
+cmd_list_locations() {
+    echo -e "${CYAN}=== Data Center Locations ===${NC}"
+    api GET "/locations" | jq -r '.locations[] | "\(.name)\t\(.city)\t\(.country)\t\(.description)"' | \
+        column -t -s $'\t' -N "ID,CITY,COUNTRY,DESCRIPTION"
+}
+
+cmd_list_all() {
+    cmd_list_servers
+    echo ""
+    cmd_list_firewalls
+    echo ""
+    cmd_list_ssh_keys
+}
+
+cmd_get_server() {
+    local server_id=$1
+
+    if [[ -z "$server_id" ]]; then
+        echo -e "${RED}Error: Server ID required${NC}"
+        echo "Usage: $0 get-server <id>"
+        exit 1
+    fi
+
+    api GET "/servers/$server_id" | jq '.server'
+}
+
+cmd_delete_server() {
+    local server_id=$1
+
+    if [[ -z "$server_id" ]]; then
+        echo -e "${RED}Error: Server ID required${NC}"
+        echo "Usage: $0 delete-server <id>"
+        exit 1
+    fi
+
+    # Get server info first
+    local server_info
+    server_info=$(api GET "/servers/$server_id")
+    local server_name
+    server_name=$(echo "$server_info" | jq -r '.server.name')
+
+    echo -e "${YELLOW}Warning: This will permanently delete server '$server_name' (ID: $server_id)${NC}"
+
+    if ! confirm_action "Type the server name to confirm:" "$server_name"; then
+        echo "Deletion cancelled"
+        exit 1
+    fi
+
+    echo "Deleting server..."
+    api DELETE "/servers/$server_id" | jq '.'
+    echo -e "${GREEN}Server deleted${NC}"
+}
+
+cmd_add_ssh_key() {
+    local name=${1:-}
+    local key_file=${2:-}
+
+    # Interactive mode if no args
+    if [[ -z "$name" ]]; then
+        read -p "SSH key name: " name
+    fi
+
+    if [[ -z "$key_file" ]]; then
+        # Auto-detect key
+        if [[ -f "$HOME/.ssh/id_ed25519.pub" ]]; then
+            key_file="$HOME/.ssh/id_ed25519.pub"
+        elif [[ -f "$HOME/.ssh/id_rsa.pub" ]]; then
+            key_file="$HOME/.ssh/id_rsa.pub"
+        else
+            read -p "Path to public key: " key_file
+        fi
+    fi
+
+    if [[ ! -f "$key_file" ]]; then
+        echo -e "${RED}Error: Key file not found: $key_file${NC}"
+        exit 1
+    fi
+
+    local public_key
+    public_key=$(cat "$key_file")
+
+    echo "Adding SSH key '$name' from $key_file..."
+    local response
+    response=$(api POST "/ssh_keys" "{\"name\": \"$name\", \"public_key\": \"$public_key\"}")
+
+    if echo "$response" | jq -e '.ssh_key' > /dev/null 2>&1; then
+        local key_id
+        key_id=$(echo "$response" | jq -r '.ssh_key.id')
+        echo -e "${GREEN}SSH key added with ID: $key_id${NC}"
+    else
+        echo -e "${RED}Error adding SSH key:${NC}"
+        echo "$response" | jq '.'
+        exit 1
+    fi
+}
+
+cmd_create_server() {
+    local name=${1:-}
+    local server_type=${2:-}
+    local image=${3:-}
+    local location=${4:-}
+    local ssh_key_name=${5:-}
+
+    # Interactive mode if no args provided
+    if [[ -z "$name" ]]; then
+        echo -e "${CYAN}=== Create New Server ===${NC}"
+        echo ""
+
+        # Server name
+        read -p "Server name: " name
+
+        # Show types
+        echo -e "\n${BLUE}Available server types:${NC}"
+        cmd_list_types 2>/dev/null | head -15
+        echo ""
+        read -p "Server type [cpx11]: " server_type
+        server_type=${server_type:-cpx11}
+
+        # Show images
+        echo -e "\n${BLUE}Available images:${NC}"
+        api GET "/images?type=system" | jq -r '.images[] | select(.os_flavor == "ubuntu" or .os_flavor == "debian") | "\(.name)"' | sort -u | head -10
+        echo ""
+        read -p "Image [ubuntu-24.04]: " image
+        image=${image:-ubuntu-24.04}
+
+        # Show locations
+        echo -e "\n${BLUE}Available locations:${NC}"
+        api GET "/locations" | jq -r '.locations[] | "\(.name) - \(.city)"'
+        echo ""
+        read -p "Location [hil]: " location
+        location=${location:-hil}
+
+        # SSH key
+        echo -e "\n${BLUE}SSH Keys:${NC}"
+        local keys
+        keys=$(api GET "/ssh_keys" | jq -r '.ssh_keys[] | "\(.name)"')
+        if [[ -z "$keys" ]]; then
+            echo "No SSH keys found. Add one first with: $0 add-ssh-key <name>"
+            exit 1
+        fi
+        echo "$keys"
+        echo ""
+        read -p "SSH key name: " ssh_key_name
+    fi
+
+    # Defaults for non-interactive
+    server_type=${server_type:-cpx11}
+    image=${image:-ubuntu-24.04}
+    location=${location:-hil}
+
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Error: Server name required${NC}"
+        exit 1
+    fi
+
+    if [[ -z "$ssh_key_name" ]]; then
+        echo -e "${RED}Error: SSH key name required${NC}"
+        exit 1
+    fi
+
+    echo ""
+    echo -e "Creating server:"
+    echo -e "  Name:     ${GREEN}$name${NC}"
+    echo -e "  Type:     $server_type"
+    echo -e "  Image:    $image"
+    echo -e "  Location: $location"
+    echo -e "  SSH Key:  $ssh_key_name"
+    echo ""
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    echo "Creating server..."
+    local response
+    response=$(api POST "/servers" "{
+        \"name\": \"$name\",
+        \"server_type\": \"$server_type\",
+        \"image\": \"$image\",
+        \"location\": \"$location\",
+        \"ssh_keys\": [\"$ssh_key_name\"],
+        \"start_after_create\": true
+    }")
+
+    if echo "$response" | jq -e '.server' > /dev/null 2>&1; then
+        local server_id ip
+        server_id=$(echo "$response" | jq -r '.server.id')
+        ip=$(echo "$response" | jq -r '.server.public_net.ipv4.ip')
+        echo -e "${GREEN}Server created!${NC}"
+        echo -e "  ID: $server_id"
+        echo -e "  IP: $ip"
+        echo ""
+        echo "Wait ~30s for boot, then: ssh root@$ip"
+    else
+        echo -e "${RED}Error creating server:${NC}"
+        echo "$response" | jq '.'
+        exit 1
+    fi
+}
+
+cmd_get_costs() {
+    echo -e "${CYAN}=== Current Resource Costs ===${NC}"
+
+    # Get all servers and calculate costs
+    local servers
+    servers=$(api GET "/servers")
+
+    local total=0
+
+    echo -e "\n${BLUE}Servers:${NC}"
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local name type price
+            name=$(echo "$line" | cut -f1)
+            type=$(echo "$line" | cut -f2)
+            price=$(echo "$line" | cut -f3)
+            total=$(echo "$total + $price" | bc)
+            printf "  %-20s %-10s €%s/mo\n" "$name" "$type" "$price"
+        fi
+    done < <(echo "$servers" | jq -r '.servers[] | "\(.name)\t\(.server_type.name)\t\(.server_type.prices[0].price_monthly.gross)"')
+
+    # Get floating IPs
+    local floating_ips
+    floating_ips=$(api GET "/floating_ips")
+    local fip_count
+    fip_count=$(echo "$floating_ips" | jq '.floating_ips | length')
+
+    if [[ "$fip_count" != "0" ]]; then
+        echo -e "\n${BLUE}Floating IPs:${NC}"
+        while IFS= read -r line; do
+            if [[ -n "$line" ]]; then
+                local ip assigned
+                ip=$(echo "$line" | cut -f1)
+                assigned=$(echo "$line" | cut -f2)
+                if [[ "$assigned" == "null" ]]; then
+                    total=$(echo "$total + 4.00" | bc)
+                    printf "  %-20s (unassigned) €4.00/mo\n" "$ip"
+                else
+                    printf "  %-20s (assigned)   €0.00/mo\n" "$ip"
+                fi
+            fi
+        done < <(echo "$floating_ips" | jq -r '.floating_ips[] | "\(.ip)\t\(.server)"')
+    fi
+
+    echo -e "\n${GREEN}Estimated Monthly Total: €$total${NC}"
+    echo -e "${YELLOW}Note: Does not include bandwidth overages or snapshots${NC}"
+}
+
+cmd_ssh() {
+    local server_name=$1
+    shift || true  # Remove server name from args, keep the rest
+
+    if [[ -z "$server_name" ]]; then
+        echo -e "${RED}Error: Server name required${NC}"
+        echo "Usage: $0 ssh <name> [command...]"
+        exit 1
+    fi
+
+    # Find server by name
+    local response
+    response=$(api GET "/servers?name=$server_name")
+
+    local count
+    count=$(echo "$response" | jq '.servers | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo -e "${RED}Error: Server not found: $server_name${NC}"
+        exit 1
+    fi
+
+    local ip
+    ip=$(echo "$response" | jq -r '.servers[0].public_net.ipv4.ip')
+
+    if [[ -z "$ip" || "$ip" == "null" ]]; then
+        echo -e "${RED}Error: Server has no public IP${NC}"
+        exit 1
+    fi
+
+    if [[ $# -gt 0 ]]; then
+        # Execute command on server
+        ssh -o StrictHostKeyChecking=accept-new "root@$ip" "$@"
+    else
+        # Interactive session
+        echo -e "${CYAN}Connecting to $server_name ($ip)...${NC}"
+        exec ssh "root@$ip"
+    fi
+}
+
+cmd_status() {
+    local server_name=$1
+
+    if [[ -z "$server_name" ]]; then
+        echo -e "${RED}Error: Server name required${NC}"
+        echo "Usage: $0 status <name>"
+        exit 1
+    fi
+
+    # Find server by name
+    local response
+    response=$(api GET "/servers?name=$server_name")
+
+    local count
+    count=$(echo "$response" | jq '.servers | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo -e "${RED}Error: Server not found: $server_name${NC}"
+        exit 1
+    fi
+
+    local server
+    server=$(echo "$response" | jq '.servers[0]')
+
+    local status ip type location created
+    status=$(echo "$server" | jq -r '.status')
+    ip=$(echo "$server" | jq -r '.public_net.ipv4.ip // "none"')
+    type=$(echo "$server" | jq -r '.server_type.name')
+    location=$(echo "$server" | jq -r '.datacenter.name')
+    created=$(echo "$server" | jq -r '.created')
+    server_id=$(echo "$server" | jq -r '.id')
+
+    # Color status
+    local status_color
+    case "$status" in
+        running)  status_color="${GREEN}${status}${NC}" ;;
+        off)      status_color="${RED}${status}${NC}" ;;
+        *)        status_color="${YELLOW}${status}${NC}" ;;
+    esac
+
+    echo -e "${CYAN}$server_name${NC}"
+    echo -e "  Status:   $status_color"
+    echo -e "  IP:       $ip"
+    echo -e "  Type:     $type"
+    echo -e "  Location: $location"
+    echo -e "  ID:       $server_id"
+    echo -e "  Created:  $created"
+}
+
+cmd_reboot() {
+    local server_id=$1
+
+    if [[ -z "$server_id" ]]; then
+        echo -e "${RED}Error: Server ID required${NC}"
+        echo "Usage: $0 reboot <id>"
+        exit 1
+    fi
+
+    # Get server info
+    local server_info
+    server_info=$(api GET "/servers/$server_id")
+    local server_name
+    server_name=$(echo "$server_info" | jq -r '.server.name')
+
+    echo -e "${YELLOW}Rebooting server '$server_name' (ID: $server_id)${NC}"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Reboot cancelled"
+        exit 0
+    fi
+
+    echo "Rebooting..."
+    api POST "/servers/$server_id/actions/reboot" | jq '.action.status'
+    echo -e "${GREEN}Reboot initiated${NC}"
+}
+
+cmd_power_on() {
+    local server_id=$1
+
+    if [[ -z "$server_id" ]]; then
+        echo -e "${RED}Error: Server ID required${NC}"
+        echo "Usage: $0 power-on <id>"
+        exit 1
+    fi
+
+    # Get server info
+    local server_info
+    server_info=$(api GET "/servers/$server_id")
+    local server_name
+    server_name=$(echo "$server_info" | jq -r '.server.name')
+
+    echo -e "${YELLOW}Powering on server '$server_name' (ID: $server_id)${NC}"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Power on cancelled"
+        exit 0
+    fi
+
+    echo "Powering on..."
+    api POST "/servers/$server_id/actions/poweron" | jq '.action.status'
+    echo -e "${GREEN}Power on initiated${NC}"
+}
+
+cmd_console() {
+    local server_id=$1
+
+    if [[ -z "$server_id" ]]; then
+        echo -e "${RED}Error: Server ID required${NC}"
+        echo "Usage: $0 console <id>"
+        exit 1
+    fi
+
+    # Get server info
+    local server_info
+    server_info=$(api GET "/servers/$server_id")
+    local server_name
+    server_name=$(echo "$server_info" | jq -r '.server.name')
+
+    echo -e "${CYAN}Requesting VNC console for '$server_name' (ID: $server_id)...${NC}"
+
+    local response
+    response=$(api POST "/servers/$server_id/actions/request_console")
+
+    local wss_url password
+    wss_url=$(echo "$response" | jq -r '.wss_url // empty')
+    password=$(echo "$response" | jq -r '.password // empty')
+
+    if [[ -z "$wss_url" ]]; then
+        echo -e "${RED}Error: Failed to get console URL${NC}"
+        echo "$response" | jq '.'
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${GREEN}VNC Console Ready${NC}"
+    echo ""
+    echo "WebSocket URL: $wss_url"
+    echo "Password:      $password"
+    echo ""
+    echo "Note: The console URL is valid for a limited time."
+    echo "Use a WebSocket VNC client or Hetzner Cloud Console to connect."
+}
+
+cmd_power_off() {
+    local server_id=$1
+
+    if [[ -z "$server_id" ]]; then
+        echo -e "${RED}Error: Server ID required${NC}"
+        echo "Usage: $0 power-off <id>"
+        exit 1
+    fi
+
+    # Get server info
+    local server_info
+    server_info=$(api GET "/servers/$server_id")
+    local server_name
+    server_name=$(echo "$server_info" | jq -r '.server.name')
+
+    echo -e "${YELLOW}Warning: Powering off server '$server_name' (ID: $server_id)${NC}"
+    echo "This is a hard power off. Use 'ssh' and 'shutdown' for graceful shutdown."
+
+    if ! confirm_action "Proceed?"; then
+        echo "Power off cancelled"
+        exit 0
+    fi
+
+    echo "Powering off..."
+    api POST "/servers/$server_id/actions/poweroff" | jq '.action.status'
+    echo -e "${GREEN}Power off initiated${NC}"
+}
+
+# Firewall commands
+
+cmd_create_firewall() {
+    local name=${1:-}
+    local ports=${2:-}
+
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Error: Firewall name required${NC}"
+        echo "Usage: $0 create-firewall <name> <ports>"
+        echo "  ports: comma-separated, e.g. 22,80,443,10000/udp"
+        exit 1
+    fi
+
+    if [[ -z "$ports" ]]; then
+        echo -e "${RED}Error: Ports required${NC}"
+        echo "Usage: $0 create-firewall <name> <ports>"
+        echo "Example: $0 create-firewall my-fw 22,80,443,3478/udp,10000/udp"
+        exit 1
+    fi
+
+    # Check if firewall already exists
+    local existing
+    existing=$(api GET "/firewalls" | jq -r ".firewalls[] | select(.name == \"$name\") | .id")
+
+    if [[ -n "$existing" && "$existing" != "null" ]]; then
+        echo -e "${YELLOW}Firewall '$name' already exists (ID: $existing)${NC}"
+        echo "$existing"
+        return 0
+    fi
+
+    # Build rules JSON from port list
+    local rules="["
+    local first=true
+
+    IFS=',' read -ra port_list <<< "$ports"
+    for port_spec in "${port_list[@]}"; do
+        local port protocol="tcp"
+        if [[ "$port_spec" == */udp ]]; then
+            protocol="udp"
+            port="${port_spec%/udp}"
+        elif [[ "$port_spec" == */tcp ]]; then
+            port="${port_spec%/tcp}"
+        else
+            port="$port_spec"
+        fi
+
+        if [[ "$first" != "true" ]]; then
+            rules+=","
+        fi
+        first=false
+
+        rules+="{\"direction\":\"in\",\"protocol\":\"$protocol\",\"port\":\"$port\",\"source_ips\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"$port/$protocol\"}"
+    done
+
+    # Always add ICMP
+    rules+=",{\"direction\":\"in\",\"protocol\":\"icmp\",\"source_ips\":[\"0.0.0.0/0\",\"::/0\"],\"description\":\"ICMP\"}"
+    rules+="]"
+
+    echo "Creating firewall '$name' with ports: $ports"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api POST "/firewalls" "{\"name\": \"$name\", \"rules\": $rules}")
+
+    local fw_id
+    fw_id=$(echo "$response" | jq -r '.firewall.id')
+
+    if [[ -z "$fw_id" || "$fw_id" == "null" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.error.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Firewall created: $fw_id${NC}"
+}
+
+cmd_apply_firewall() {
+    local fw_id=${1:-}
+    local server_id=${2:-}
+
+    if [[ -z "$fw_id" || -z "$server_id" ]]; then
+        echo -e "${RED}Error: Firewall ID and server ID required${NC}"
+        echo "Usage: $0 apply-firewall <firewall-id> <server-id>"
+        exit 1
+    fi
+
+    echo "Applying firewall $fw_id to server $server_id..."
+    local response
+    response=$(api POST "/firewalls/$fw_id/actions/apply_to_resources" \
+        "{\"apply_to\": [{\"type\": \"server\", \"server\": {\"id\": $server_id}}]}")
+
+    local action_status
+    action_status=$(echo "$response" | jq -r '.actions[0].status // .action.status // "unknown"')
+
+    if [[ "$action_status" == "error" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.actions[0].error.message // .error.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Firewall applied${NC}"
+}
+
+cmd_delete_firewall() {
+    local fw_id=${1:-}
+
+    if [[ -z "$fw_id" ]]; then
+        echo -e "${RED}Error: Firewall ID required${NC}"
+        echo "Usage: $0 delete-firewall <id>"
+        exit 1
+    fi
+
+    # Get firewall info
+    local fw_info
+    fw_info=$(api GET "/firewalls/$fw_id")
+    local fw_name
+    fw_name=$(echo "$fw_info" | jq -r '.firewall.name')
+
+    echo -e "${YELLOW}Deleting firewall '$fw_name' (ID: $fw_id)${NC}"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    api DELETE "/firewalls/$fw_id" > /dev/null
+    echo -e "${GREEN}Firewall deleted${NC}"
+}
+
+# Main
+main() {
+    parse_global_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+
+    local cmd=${1:-}
+
+    if [[ -z "$cmd" ]]; then
+        usage "$0"
+    fi
+
+    load_token
+
+    case "$cmd" in
+        list-servers)    cmd_list_servers ;;
+        list-firewalls)  cmd_list_firewalls ;;
+        list-ssh-keys)   cmd_list_ssh_keys ;;
+        list-images)     cmd_list_images ;;
+        list-types)      cmd_list_types ;;
+        list-locations)  cmd_list_locations ;;
+        list-all)        cmd_list_all ;;
+        get-server)      cmd_get_server "${2:-}" ;;
+        add-ssh-key)     cmd_add_ssh_key "${2:-}" "${3:-}" ;;
+        create-server)   cmd_create_server "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
+        delete-server)   cmd_delete_server "${2:-}" ;;
+        create-firewall) cmd_create_firewall "${2:-}" "${3:-}" ;;
+        apply-firewall)  cmd_apply_firewall "${2:-}" "${3:-}" ;;
+        delete-firewall) cmd_delete_firewall "${2:-}" ;;
+        get-costs)       cmd_get_costs ;;
+        ssh)             shift; cmd_ssh "$@" ;;
+        status)          cmd_status "${2:-}" ;;
+        console)         cmd_console "${2:-}" ;;
+        reboot)          cmd_reboot "${2:-}" ;;
+        power-on)        cmd_power_on "${2:-}" ;;
+        power-off)       cmd_power_off "${2:-}" ;;
+        -h|--help|help)  usage "$0" ;;
+        *)
+            echo -e "${RED}Unknown command: $cmd${NC}"
+            usage "$0"
+            ;;
+    esac
+}
+
+main "$@"
