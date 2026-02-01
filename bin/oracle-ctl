@@ -1,0 +1,1221 @@
+#!/usr/bin/env bash
+#
+# Oracle Cloud Infrastructure Management CLI
+# Simple primitives for managing OCI resources
+#
+# Usage: oracle-ctl <command> [args...]
+#
+# Commands:
+#   list-instances     List all compute instances
+#   list-vcns          List all VCNs (virtual networks)
+#   list-subnets       List all subnets
+#   list-security      List security lists (firewalls)
+#   list-shapes        List available instance shapes
+#   list-images        List available images
+#   list-all           List all resources
+#
+#   get-instance <id>  Get instance details
+#   create-network [name] [--ports 22,80,443,3478/udp,10000/udp]
+#                      Create VCN, subnet, gateway, security list
+#   create-instance [name] [shape] [ocpus] [memory] [ssh-key]  Create instance
+#   delete-instance <id>   Delete an instance
+#   delete-network [name]  Delete network infrastructure
+#
+#   get-limits         Show service limits (for free tier)
+#   get-costs          Show usage and estimated costs
+#
+#   ssh <name> [cmd]   SSH into instance by name, optionally run command
+#   status <name>      Show instance status, IP, and shape
+#   console <id>       Create serial console connection
+#   reboot <id>        Reboot an instance (SOFTRESET)
+#   power-on <id>      Start an instance
+#   power-off <id>     Stop an instance
+#
+# Options:
+#   -y, --yes          Skip confirmation prompts (for scripting)
+#
+# Prerequisites:
+#   - oci-cli installed (pip install oci-cli)
+#   - ~/.oci/config configured
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Try to find oci-cli in common locations
+if ! command -v oci &> /dev/null; then
+    # Check common venv locations
+    for venv_path in "$HOME/venv" "$HOME/.venv" "$HOME/oci-venv"; do
+        if [[ -f "$venv_path/bin/oci" ]]; then
+            export PATH="$venv_path/bin:$PATH"
+            break
+        fi
+    done
+fi
+
+# Load config
+OCI_COMPARTMENT_ID=""
+
+load_config() {
+    local config_file="${HOME}/.oci/config"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo -e "${RED}Error: OCI config not found at ~/.oci/config${NC}"
+        echo "Run 'oci setup config' to configure"
+        exit 1
+    fi
+
+    if ! command -v oci &> /dev/null; then
+        echo -e "${RED}Error: oci-cli not installed${NC}"
+        echo "Install with: pip install oci-cli"
+        exit 1
+    fi
+
+    # Get tenancy OCID for compartment
+    OCI_COMPARTMENT_ID=$(grep -A20 '^\[DEFAULT\]' "$config_file" | grep '^tenancy=' | head -1 | cut -d= -f2)
+
+    if [[ -z "$OCI_COMPARTMENT_ID" ]]; then
+        echo -e "${RED}Error: Could not read tenancy from config${NC}"
+        exit 1
+    fi
+}
+
+# OCI CLI wrapper
+oci_cmd() {
+    oci "$@" 2>/dev/null
+}
+
+# Commands
+cmd_list_instances() {
+    echo -e "${CYAN}=== Compute Instances ===${NC}"
+
+    local response
+    response=$(oci_cmd compute instance list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query 'data[*].{id:id, name:"display-name", shape:shape, state:"lifecycle-state", created:"time-created"}' \
+        --output json)
+
+    local count
+    count=$(echo "$response" | jq 'length')
+
+    if [[ "$count" == "0" || -z "$count" ]]; then
+        echo "No instances found"
+        return
+    fi
+
+    echo "$response" | jq -r '.[] | "\(.id | split(".") | .[-1])\t\(.name)\t\(.shape)\t\(.state)"' | \
+        column -t -s $'\t' -N "ID(short),NAME,SHAPE,STATE"
+
+    # Also show IPs if instances exist
+    echo -e "\n${BLUE}Instance IPs:${NC}"
+    while IFS= read -r instance_id; do
+        if [[ -n "$instance_id" ]]; then
+            local name ip
+            name=$(echo "$response" | jq -r ".[] | select(.id == \"$instance_id\") | .name")
+
+            # Get VNIC attachment
+            local vnic_id
+            vnic_id=$(oci_cmd compute vnic-attachment list \
+                --compartment-id "$OCI_COMPARTMENT_ID" \
+                --instance-id "$instance_id" \
+                --query 'data[0]."vnic-id"' --raw-output 2>/dev/null || echo "")
+
+            if [[ -n "$vnic_id" && "$vnic_id" != "null" ]]; then
+                ip=$(oci_cmd network vnic get \
+                    --vnic-id "$vnic_id" \
+                    --query 'data."public-ip"' --raw-output 2>/dev/null || echo "no-ip")
+            else
+                ip="no-vnic"
+            fi
+
+            printf "  %-30s %s\n" "$name" "$ip"
+        fi
+    done < <(echo "$response" | jq -r '.[].id')
+}
+
+cmd_list_vcns() {
+    echo -e "${CYAN}=== Virtual Cloud Networks ===${NC}"
+
+    local response
+    response=$(oci_cmd network vcn list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query 'data[*].{id:id, name:"display-name", cidr:"cidr-block", state:"lifecycle-state"}' \
+        --output json)
+
+    local count
+    count=$(echo "$response" | jq 'length')
+
+    if [[ "$count" == "0" || -z "$count" ]]; then
+        echo "No VCNs found"
+        return
+    fi
+
+    echo "$response" | jq -r '.[] | "\(.id | split(".") | .[-1])\t\(.name)\t\(.cidr)\t\(.state)"' | \
+        column -t -s $'\t' -N "ID(short),NAME,CIDR,STATE"
+}
+
+cmd_list_subnets() {
+    echo -e "${CYAN}=== Subnets ===${NC}"
+
+    local response
+    response=$(oci_cmd network subnet list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query 'data[*].{id:id, name:"display-name", cidr:"cidr-block", ad:"availability-domain"}' \
+        --output json)
+
+    local count
+    count=$(echo "$response" | jq 'length')
+
+    if [[ "$count" == "0" || -z "$count" ]]; then
+        echo "No subnets found"
+        return
+    fi
+
+    echo "$response" | jq -r '.[] | "\(.id | split(".") | .[-1])\t\(.name)\t\(.cidr)\t\(.ad // "regional")"' | \
+        column -t -s $'\t' -N "ID(short),NAME,CIDR,AD"
+}
+
+cmd_list_security() {
+    echo -e "${CYAN}=== Security Lists ===${NC}"
+
+    # First get VCNs
+    local vcns
+    vcns=$(oci_cmd network vcn list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query 'data[*].id' --raw-output)
+
+    for vcn_id in $vcns; do
+        local response
+        response=$(oci_cmd network security-list list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --vcn-id "$vcn_id" \
+            --all \
+            --query 'data[*].{id:id, name:"display-name", ingress:"ingress-security-rules", egress:"egress-security-rules"}' \
+            --output json 2>/dev/null || echo "[]")
+
+        local count
+        count=$(echo "$response" | jq 'length')
+
+        if [[ "$count" != "0" && -n "$count" ]]; then
+            echo "$response" | jq -r '.[] | "\(.id | split(".") | .[-1])\t\(.name)\t\(.ingress | length) ingress\t\(.egress | length) egress"' | \
+                column -t -s $'\t' -N "ID(short),NAME,INGRESS_RULES,EGRESS_RULES"
+        fi
+    done
+}
+
+cmd_list_shapes() {
+    echo -e "${CYAN}=== Available Shapes ===${NC}"
+    echo -e "${YELLOW}(Showing shapes available in your tenancy)${NC}\n"
+
+    oci_cmd compute shape list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query 'data[*].{shape:shape, ocpus:ocpus, memory:"memory-in-gbs", gpu:"gpus"}' \
+        --output table
+}
+
+cmd_list_images() {
+    echo -e "${CYAN}=== Available Ubuntu Images ===${NC}"
+
+    oci_cmd compute image list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --operating-system "Canonical Ubuntu" \
+        --all \
+        --query 'data[*].{name:"display-name", version:"operating-system-version", created:"time-created"}' \
+        --output table | head -20
+}
+
+cmd_list_all() {
+    cmd_list_instances
+    echo ""
+    cmd_list_vcns
+    echo ""
+    cmd_list_subnets
+    echo ""
+    cmd_list_security
+}
+
+cmd_get_instance() {
+    local instance_id=$1
+
+    if [[ -z "$instance_id" ]]; then
+        echo -e "${RED}Error: Instance ID required${NC}"
+        echo "Usage: $0 get-instance <ocid>"
+        exit 1
+    fi
+
+    oci_cmd compute instance get \
+        --instance-id "$instance_id" \
+        --query 'data' \
+        --output json | jq '.'
+}
+
+cmd_delete_instance() {
+    local instance_id=$1
+
+    if [[ -z "$instance_id" ]]; then
+        echo -e "${RED}Error: Instance ID required${NC}"
+        echo "Usage: $0 delete-instance <ocid>"
+        exit 1
+    fi
+
+    # Get instance info
+    local instance_info
+    instance_info=$(oci_cmd compute instance get --instance-id "$instance_id" --query 'data' --output json)
+    local instance_name
+    instance_name=$(echo "$instance_info" | jq -r '."display-name"')
+
+    echo -e "${YELLOW}Warning: This will permanently delete instance '$instance_name'${NC}"
+    echo "Instance ID: $instance_id"
+
+    if ! confirm_action "Type 'DELETE' to confirm:" "DELETE"; then
+        echo "Deletion cancelled"
+        exit 1
+    fi
+
+    echo "Terminating instance..."
+    oci_cmd compute instance terminate \
+        --instance-id "$instance_id" \
+        --preserve-boot-volume false \
+        --force
+
+    echo -e "${GREEN}Instance termination initiated${NC}"
+}
+
+cmd_get_limits() {
+    echo -e "${CYAN}=== Free Tier Limits ===${NC}"
+    echo ""
+    echo -e "${BLUE}Always Free Resources:${NC}"
+    echo "  ARM Compute (A1.Flex):     4 OCPUs + 24 GB RAM total"
+    echo "  AMD Compute (E2.1.Micro):  2 instances (1/8 OCPU, 1GB each)"
+    echo "  Block Storage:             200 GB total"
+    echo "  Object Storage:            20 GB (10 Standard + 10 Archive)"
+    echo "  Outbound Data:             10 TB/month"
+    echo "  Load Balancer:             1 flexible (10 Mbps)"
+    echo ""
+
+    echo -e "${BLUE}Current Usage:${NC}"
+
+    # Count instances
+    local instances
+    instances=$(oci_cmd compute instance list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --lifecycle-state RUNNING \
+        --all \
+        --query 'data[*].{shape:shape, ocpus:"shape-config".ocpus, memory:"shape-config"."memory-in-gbs"}' \
+        --output json 2>/dev/null || echo "[]")
+
+    local arm_ocpus=0
+    local arm_memory=0
+    local amd_count=0
+
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local shape ocpus memory
+            shape=$(echo "$line" | jq -r '.shape')
+            ocpus=$(echo "$line" | jq -r '.ocpus // 0')
+            memory=$(echo "$line" | jq -r '.memory // 0')
+
+            if [[ "$shape" == *"A1"* ]]; then
+                arm_ocpus=$(echo "$arm_ocpus + $ocpus" | bc)
+                arm_memory=$(echo "$arm_memory + $memory" | bc)
+            elif [[ "$shape" == *"Micro"* ]]; then
+                ((amd_count++)) || true
+            fi
+        fi
+    done < <(echo "$instances" | jq -c '.[]')
+
+    echo "  ARM OCPUs used:    $arm_ocpus / 4"
+    echo "  ARM Memory used:   $arm_memory GB / 24 GB"
+    echo "  AMD Micro used:    $amd_count / 2"
+    echo ""
+
+    # Block volume usage
+    local volumes
+    volumes=$(oci_cmd bv volume list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query 'data[*]."size-in-gbs"' \
+        --output json 2>/dev/null || echo "[]")
+
+    local total_storage=0
+    while IFS= read -r size; do
+        if [[ -n "$size" && "$size" != "null" ]]; then
+            total_storage=$(echo "$total_storage + $size" | bc)
+        fi
+    done < <(echo "$volumes" | jq -r '.[]')
+
+    # Boot volumes
+    local boot_volumes
+    boot_volumes=$(oci_cmd bv boot-volume list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query 'data[*]."size-in-gbs"' \
+        --output json 2>/dev/null || echo "[]")
+
+    while IFS= read -r size; do
+        if [[ -n "$size" && "$size" != "null" ]]; then
+            total_storage=$(echo "$total_storage + $size" | bc)
+        fi
+    done < <(echo "$boot_volumes" | jq -r '.[]')
+
+    echo "  Block Storage:     $total_storage GB / 200 GB"
+}
+
+cmd_create_network() {
+    local name=${1:-}
+    shift || true
+    local ports="22,80,443"
+
+    # Parse optional --ports flag
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ports) ports="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        read -p "Network name: " name
+        read -p "Ingress ports [22,80,443]: " ports_input
+        ports=${ports_input:-22,80,443}
+    fi
+
+    name=${name:-kiosk-network}
+
+    # Build OCI ingress rules from port list
+    local ingress_rules="["
+    local first=true
+
+    IFS=',' read -ra port_list <<< "$ports"
+    for port_spec in "${port_list[@]}"; do
+        local port protocol="6" proto_name="tcp" options_key="tcpOptions"
+        if [[ "$port_spec" == */udp ]]; then
+            protocol="17"
+            proto_name="udp"
+            options_key="udpOptions"
+            port="${port_spec%/udp}"
+        elif [[ "$port_spec" == */tcp ]]; then
+            port="${port_spec%/tcp}"
+        else
+            port="$port_spec"
+        fi
+
+        if [[ "$first" != "true" ]]; then
+            ingress_rules+=","
+        fi
+        first=false
+
+        ingress_rules+="{\"source\":\"0.0.0.0/0\",\"protocol\":\"$protocol\",\"isStateless\":false,\"${options_key}\":{\"destinationPortRange\":{\"min\":$port,\"max\":$port}}}"
+    done
+    ingress_rules+="]"
+
+    echo -e "${CYAN}=== Creating Network Infrastructure ===${NC}"
+    echo -e "  Name prefix: ${GREEN}$name${NC}"
+    echo -e "  Ports:       ${GREEN}$ports${NC}"
+    echo ""
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    # 1. Create VCN
+    echo -e "\n${BLUE}[1/5] Creating VCN...${NC}"
+    local vcn_response
+    vcn_response=$(oci network vcn create \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --cidr-block "10.0.0.0/16" \
+        --display-name "${name}-vcn" \
+        --dns-label "${name//[^a-z0-9]/}vcn" \
+        --wait-for-state AVAILABLE \
+        --query 'data.id' --raw-output)
+
+    if [[ -z "$vcn_response" ]]; then
+        echo -e "${RED}Error creating VCN${NC}"
+        exit 1
+    fi
+    local vcn_id="$vcn_response"
+    echo "  VCN ID: ${vcn_id##*.}"
+
+    # 2. Create Internet Gateway
+    echo -e "\n${BLUE}[2/5] Creating Internet Gateway...${NC}"
+    local igw_response
+    igw_response=$(oci network internet-gateway create \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --vcn-id "$vcn_id" \
+        --is-enabled true \
+        --display-name "${name}-igw" \
+        --wait-for-state AVAILABLE \
+        --query 'data.id' --raw-output)
+
+    if [[ -z "$igw_response" ]]; then
+        echo -e "${RED}Error creating Internet Gateway${NC}"
+        exit 1
+    fi
+    local igw_id="$igw_response"
+    echo "  Internet Gateway ID: ${igw_id##*.}"
+
+    # 3. Get default route table and add internet route
+    echo -e "\n${BLUE}[3/5] Configuring Route Table...${NC}"
+    local rt_id
+    rt_id=$(oci network route-table list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --vcn-id "$vcn_id" \
+        --query 'data[0].id' --raw-output)
+
+    oci network route-table update \
+        --rt-id "$rt_id" \
+        --route-rules "[{\"cidrBlock\":\"0.0.0.0/0\",\"networkEntityId\":\"$igw_id\"}]" \
+        --force \
+        --wait-for-state AVAILABLE > /dev/null
+    echo "  Route table configured for internet access"
+
+    # 4. Create Security List with appropriate rules
+    echo -e "\n${BLUE}[4/5] Creating Security List...${NC}"
+    local sl_response
+    sl_response=$(oci network security-list create \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --vcn-id "$vcn_id" \
+        --display-name "${name}-seclist" \
+        --egress-security-rules '[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]' \
+        --ingress-security-rules "$ingress_rules" \
+        --wait-for-state AVAILABLE \
+        --query 'data.id' --raw-output)
+
+    if [[ -z "$sl_response" ]]; then
+        echo -e "${RED}Error creating Security List${NC}"
+        exit 1
+    fi
+    local sl_id="$sl_response"
+    echo "  Security List ID: ${sl_id##*.}"
+
+    # 5. Create Subnet
+    echo -e "\n${BLUE}[5/5] Creating Subnet...${NC}"
+    local subnet_response
+    subnet_response=$(oci network subnet create \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --vcn-id "$vcn_id" \
+        --cidr-block "10.0.1.0/24" \
+        --display-name "${name}-subnet" \
+        --dns-label "${name//[^a-z0-9]/}sub" \
+        --security-list-ids "[\"$sl_id\"]" \
+        --wait-for-state AVAILABLE \
+        --query 'data.id' --raw-output)
+
+    if [[ -z "$subnet_response" ]]; then
+        echo -e "${RED}Error creating Subnet${NC}"
+        exit 1
+    fi
+    local subnet_id="$subnet_response"
+    echo "  Subnet ID: ${subnet_id##*.}"
+
+    echo -e "\n${GREEN}Network infrastructure created!${NC}"
+    echo ""
+    echo "Resources created:"
+    echo "  VCN:              ${name}-vcn"
+    echo "  Internet Gateway: ${name}-igw"
+    echo "  Security List:    ${name}-seclist (ports: $ports)"
+    echo "  Subnet:           ${name}-subnet (10.0.1.0/24)"
+    echo ""
+    echo "You can now create instances with: $0 create-instance"
+}
+
+cmd_create_instance() {
+    local name=${1:-}
+    local shape=${2:-}
+    local ocpus=${3:-}
+    local memory=${4:-}
+    local ssh_key_file=${5:-}
+
+    # Interactive mode if no args
+    if [[ -z "$name" ]]; then
+        echo -e "${CYAN}=== Create New Instance ===${NC}"
+        echo ""
+
+        read -p "Instance name: " name
+
+        echo -e "\n${BLUE}Recommended shapes for free tier:${NC}"
+        echo "  VM.Standard.A1.Flex - ARM (up to 4 OCPUs, 24GB total free)"
+        echo "  VM.Standard.E2.1.Micro - AMD (2 free instances)"
+        echo ""
+        read -p "Shape [VM.Standard.A1.Flex]: " shape
+        shape=${shape:-VM.Standard.A1.Flex}
+
+        if [[ "$shape" == *"Flex"* ]]; then
+            read -p "OCPUs [1]: " ocpus
+            ocpus=${ocpus:-1}
+            read -p "Memory GB [6]: " memory
+            memory=${memory:-6}
+        fi
+
+        # SSH key
+        if [[ -f "$HOME/.ssh/id_ed25519.pub" ]]; then
+            ssh_key_file="$HOME/.ssh/id_ed25519.pub"
+        elif [[ -f "$HOME/.ssh/id_rsa.pub" ]]; then
+            ssh_key_file="$HOME/.ssh/id_rsa.pub"
+        fi
+        echo -e "\n${BLUE}SSH Key:${NC} $ssh_key_file"
+        read -p "Use different key? [path or Enter to use above]: " alt_key
+        if [[ -n "$alt_key" ]]; then
+            ssh_key_file="$alt_key"
+        fi
+    fi
+
+    # Defaults
+    shape=${shape:-VM.Standard.A1.Flex}
+    ocpus=${ocpus:-1}
+    memory=${memory:-6}
+
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Error: Instance name required${NC}"
+        exit 1
+    fi
+
+    # Find SSH key
+    if [[ -z "$ssh_key_file" ]]; then
+        if [[ -f "$HOME/.ssh/id_ed25519.pub" ]]; then
+            ssh_key_file="$HOME/.ssh/id_ed25519.pub"
+        elif [[ -f "$HOME/.ssh/id_rsa.pub" ]]; then
+            ssh_key_file="$HOME/.ssh/id_rsa.pub"
+        fi
+    fi
+
+    if [[ ! -f "$ssh_key_file" ]]; then
+        echo -e "${RED}Error: SSH key not found: $ssh_key_file${NC}"
+        exit 1
+    fi
+
+    local ssh_key
+    ssh_key=$(cat "$ssh_key_file")
+
+    # Get subnet
+    local subnet_id
+    subnet_id=$(oci network subnet list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query 'data[0].id' --raw-output)
+
+    if [[ -z "$subnet_id" || "$subnet_id" == "null" ]]; then
+        echo -e "${RED}Error: No subnet found. Create network first with: $0 create-network${NC}"
+        exit 1
+    fi
+
+    # Get availability domain
+    local ad
+    ad=$(oci iam availability-domain list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --query 'data[0].name' --raw-output)
+
+    # Get Ubuntu image (ARM for A1 shapes, x86 for others)
+    local image_id
+    if [[ "$shape" == *"A1"* ]]; then
+        # ARM image - filter for aarch64
+        image_id=$(oci_cmd compute image list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "24.04" \
+            --sort-by TIMECREATED \
+            --sort-order DESC \
+            --query 'data[?contains("display-name", `aarch64`)] | [0].id' --raw-output)
+
+        if [[ -z "$image_id" || "$image_id" == "null" ]]; then
+            image_id=$(oci_cmd compute image list \
+                --compartment-id "$OCI_COMPARTMENT_ID" \
+                --operating-system "Canonical Ubuntu" \
+                --operating-system-version "22.04" \
+                --sort-by TIMECREATED \
+                --sort-order DESC \
+                --query 'data[?contains("display-name", `aarch64`)] | [0].id' --raw-output)
+        fi
+    else
+        # x86 image - filter OUT aarch64
+        image_id=$(oci_cmd compute image list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "24.04" \
+            --sort-by TIMECREATED \
+            --sort-order DESC \
+            --query 'data[?!contains("display-name", `aarch64`)] | [0].id' --raw-output)
+
+        if [[ -z "$image_id" || "$image_id" == "null" ]]; then
+            image_id=$(oci_cmd compute image list \
+                --compartment-id "$OCI_COMPARTMENT_ID" \
+                --operating-system "Canonical Ubuntu" \
+                --operating-system-version "22.04" \
+                --sort-by TIMECREATED \
+                --sort-order DESC \
+                --query 'data[?!contains("display-name", `aarch64`)] | [0].id' --raw-output)
+        fi
+    fi
+
+    if [[ -z "$image_id" || "$image_id" == "null" ]]; then
+        echo -e "${RED}Error: Could not find Ubuntu image for shape $shape${NC}"
+        exit 1
+    fi
+
+    echo ""
+    echo -e "Creating instance:"
+    echo -e "  Name:     ${GREEN}$name${NC}"
+    echo -e "  Shape:    $shape"
+    if [[ "$shape" == *"Flex"* ]]; then
+        echo -e "  OCPUs:    $ocpus"
+        echo -e "  Memory:   ${memory}GB"
+    fi
+    echo -e "  SSH Key:  $ssh_key_file"
+    echo ""
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    echo -e "\nCreating instance (this may take a few minutes)..."
+
+    local instance_response
+    if [[ "$shape" == *"Flex"* ]]; then
+        instance_response=$(oci compute instance launch \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$ad" \
+            --shape "$shape" \
+            --shape-config "{\"ocpus\": $ocpus, \"memoryInGBs\": $memory}" \
+            --subnet-id "$subnet_id" \
+            --image-id "$image_id" \
+            --display-name "$name" \
+            --assign-public-ip true \
+            --ssh-authorized-keys-file "$ssh_key_file" \
+            --wait-for-state RUNNING \
+            --query 'data.id' --raw-output 2>&1)
+    else
+        instance_response=$(oci compute instance launch \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$ad" \
+            --shape "$shape" \
+            --subnet-id "$subnet_id" \
+            --image-id "$image_id" \
+            --display-name "$name" \
+            --assign-public-ip true \
+            --ssh-authorized-keys-file "$ssh_key_file" \
+            --wait-for-state RUNNING \
+            --query 'data.id' --raw-output 2>&1)
+    fi
+
+    if [[ "$instance_response" == *"error"* || -z "$instance_response" ]]; then
+        echo -e "${RED}Error creating instance:${NC}"
+        echo "$instance_response"
+        exit 1
+    fi
+
+    local instance_id="$instance_response"
+
+    # Get public IP (with retry since VNIC attachment may take a moment)
+    echo "Getting instance IP..."
+    local vnic_id=""
+    local max_attempts=10
+    local attempt=1
+
+    while [[ $attempt -le $max_attempts ]]; do
+        vnic_id=$(oci_cmd compute vnic-attachment list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --instance-id "$instance_id" \
+            --query 'data[0]."vnic-id"' --raw-output 2>/dev/null || echo "")
+
+        if [[ -n "$vnic_id" && "$vnic_id" != "null" ]]; then
+            break
+        fi
+        echo "  Waiting for VNIC attachment... (attempt $attempt/$max_attempts)"
+        sleep 5
+        ((attempt++))
+    done
+
+    local public_ip="unknown"
+    if [[ -n "$vnic_id" && "$vnic_id" != "null" ]]; then
+        public_ip=$(oci_cmd network vnic get \
+            --vnic-id "$vnic_id" \
+            --query 'data."public-ip"' --raw-output 2>/dev/null || echo "unknown")
+    fi
+
+    echo -e "\n${GREEN}Instance created!${NC}"
+    echo "  ID: ${instance_id##*.}"
+    echo "  IP: $public_ip"
+    echo ""
+    if [[ "$public_ip" != "unknown" && "$public_ip" != "null" ]]; then
+        echo "Wait ~60s for boot, then: ssh ubuntu@$public_ip"
+    else
+        echo "IP not yet available. Check with: $0 status $name"
+    fi
+}
+
+cmd_delete_network() {
+    local name=${1:-}
+
+    echo -e "${CYAN}=== Delete Network Infrastructure ===${NC}"
+
+    # Find resources
+    local vcn_id subnet_id igw_id
+
+    if [[ -n "$name" ]]; then
+        vcn_id=$(oci network vcn list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --all \
+            --query "data[?\"display-name\"=='${name}-vcn'].id | [0]" --raw-output 2>/dev/null)
+    else
+        vcn_id=$(oci network vcn list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --all \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+    fi
+
+    if [[ -z "$vcn_id" || "$vcn_id" == "null" ]]; then
+        echo "No VCN found to delete"
+        return
+    fi
+
+    local vcn_name
+    vcn_name=$(oci network vcn get --vcn-id "$vcn_id" --query 'data."display-name"' --raw-output)
+
+    echo "VCN to delete: $vcn_name"
+
+    if ! confirm_action "Type 'DELETE' to confirm:" "DELETE"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    # Delete subnet
+    echo -e "\n${BLUE}[1/4] Deleting subnets...${NC}"
+    local subnets
+    subnets=$(oci network subnet list --compartment-id "$OCI_COMPARTMENT_ID" --vcn-id "$vcn_id" --all --output json 2>/dev/null | jq -r '.data[].id // empty')
+    for subnet_id in $subnets; do
+        if [[ -n "$subnet_id" ]]; then
+            echo "  Deleting subnet: ${subnet_id##*.}"
+            oci network subnet delete --subnet-id "$subnet_id" --force --wait-for-state TERMINATED 2>/dev/null || true
+        fi
+    done
+
+    # Delete security lists (except default)
+    echo -e "\n${BLUE}[2/4] Deleting security lists...${NC}"
+    local sec_lists
+    sec_lists=$(oci network security-list list --compartment-id "$OCI_COMPARTMENT_ID" --vcn-id "$vcn_id" --all --output json 2>/dev/null | jq -r '.data[] | select(."display-name" | contains("Default") | not) | .id // empty')
+    for sl_id in $sec_lists; do
+        if [[ -n "$sl_id" ]]; then
+            echo "  Deleting security list: ${sl_id##*.}"
+            oci network security-list delete --security-list-id "$sl_id" --force --wait-for-state TERMINATED 2>/dev/null || true
+        fi
+    done
+
+    # Delete internet gateway
+    echo -e "\n${BLUE}[3/4] Deleting internet gateway...${NC}"
+    local igw_id
+    igw_id=$(oci network internet-gateway list --compartment-id "$OCI_COMPARTMENT_ID" --vcn-id "$vcn_id" --all --output json 2>/dev/null | jq -r '.data[0].id // empty')
+    if [[ -n "$igw_id" ]]; then
+        # First clear route table
+        local rt_id
+        rt_id=$(oci network route-table list --compartment-id "$OCI_COMPARTMENT_ID" --vcn-id "$vcn_id" --all --output json 2>/dev/null | jq -r '.data[0].id // empty')
+        if [[ -n "$rt_id" ]]; then
+            oci network route-table update --rt-id "$rt_id" --route-rules '[]' --force --wait-for-state AVAILABLE 2>/dev/null || true
+        fi
+
+        echo "  Deleting gateway: ${igw_id##*.}"
+        oci network internet-gateway delete --ig-id "$igw_id" --force --wait-for-state TERMINATED 2>/dev/null || true
+    fi
+
+    # Delete VCN
+    echo -e "\n${BLUE}[4/4] Deleting VCN...${NC}"
+    oci network vcn delete --vcn-id "$vcn_id" --force --wait-for-state TERMINATED
+
+    echo -e "\n${GREEN}Network infrastructure deleted${NC}"
+}
+
+cmd_get_costs() {
+    echo -e "${CYAN}=== Estimated Costs ===${NC}"
+    echo ""
+    echo -e "${YELLOW}Note: Detailed cost analysis requires Cost Management API access${NC}"
+    echo ""
+
+    # List running instances with shapes
+    local instances
+    instances=$(oci_cmd compute instance list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --lifecycle-state RUNNING \
+        --all \
+        --query 'data[*].{name:"display-name", shape:shape, ocpus:"shape-config".ocpus, memory:"shape-config"."memory-in-gbs"}' \
+        --output json 2>/dev/null || echo "[]")
+
+    echo -e "${BLUE}Running Instances:${NC}"
+
+    local total=0
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local name shape ocpus memory cost
+            name=$(echo "$line" | jq -r '.name')
+            shape=$(echo "$line" | jq -r '.shape')
+            ocpus=$(echo "$line" | jq -r '.ocpus // 0')
+            memory=$(echo "$line" | jq -r '.memory // 0')
+
+            # Estimate cost (very rough)
+            if [[ "$shape" == *"A1"* ]]; then
+                # ARM: $0.01/OCPU/hr + $0.0015/GB/hr
+                cost=$(echo "($ocpus * 0.01 + $memory * 0.0015) * 730" | bc)
+            elif [[ "$shape" == *"Micro"* ]]; then
+                cost="0 (Free Tier)"
+            else
+                # Standard AMD: $0.03/OCPU/hr + $0.002/GB/hr
+                cost=$(echo "($ocpus * 0.03 + $memory * 0.002) * 730" | bc)
+            fi
+
+            if [[ "$cost" != "0 (Free Tier)" ]]; then
+                total=$(echo "$total + $cost" | bc 2>/dev/null || echo "$total")
+                printf "  %-25s %-20s ~\$%.2f/mo\n" "$name" "$shape" "$cost"
+            else
+                printf "  %-25s %-20s %s\n" "$name" "$shape" "$cost"
+            fi
+        fi
+    done < <(echo "$instances" | jq -c '.[]')
+
+    echo ""
+    echo -e "${GREEN}Estimated Monthly Total: ~\$$total${NC}"
+    echo -e "${YELLOW}(Free tier resources show as \$0)${NC}"
+}
+
+cmd_ssh() {
+    local instance_name=$1
+    shift || true  # Remove instance name from args, keep the rest
+
+    if [[ -z "$instance_name" ]]; then
+        echo -e "${RED}Error: Instance name required${NC}"
+        echo "Usage: $0 ssh <name> [command...]"
+        exit 1
+    fi
+
+    # Find instance by name
+    local instance_id
+    instance_id=$(oci_cmd compute instance list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --lifecycle-state RUNNING \
+        --query "data[?\"display-name\"=='$instance_name'].id | [0]" --raw-output)
+
+    if [[ -z "$instance_id" || "$instance_id" == "null" ]]; then
+        echo -e "${RED}Error: Running instance not found: $instance_name${NC}"
+        exit 1
+    fi
+
+    # Get VNIC attachment
+    local vnic_id
+    vnic_id=$(oci_cmd compute vnic-attachment list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --instance-id "$instance_id" \
+        --query 'data[0]."vnic-id"' --raw-output)
+
+    if [[ -z "$vnic_id" || "$vnic_id" == "null" ]]; then
+        echo -e "${RED}Error: No VNIC found for instance${NC}"
+        exit 1
+    fi
+
+    local ip
+    ip=$(oci_cmd network vnic get \
+        --vnic-id "$vnic_id" \
+        --query 'data."public-ip"' --raw-output)
+
+    if [[ -z "$ip" || "$ip" == "null" ]]; then
+        echo -e "${RED}Error: Instance has no public IP${NC}"
+        exit 1
+    fi
+
+    if [[ $# -gt 0 ]]; then
+        # Execute command on server
+        ssh -o StrictHostKeyChecking=accept-new "ubuntu@$ip" "$@"
+    else
+        # Interactive session
+        echo -e "${CYAN}Connecting to $instance_name ($ip)...${NC}"
+        exec ssh "ubuntu@$ip"
+    fi
+}
+
+cmd_status() {
+    local instance_name=$1
+
+    if [[ -z "$instance_name" ]]; then
+        echo -e "${RED}Error: Instance name required${NC}"
+        echo "Usage: $0 status <name>"
+        exit 1
+    fi
+
+    # Find instance by name (prefer RUNNING, then STOPPED, then any non-terminated)
+    local instance
+    instance=$(oci_cmd compute instance list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --all \
+        --query "data[?\"display-name\"=='$instance_name' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'] | sort_by(@, &\"time-created\") | [-1]" \
+        --output json)
+
+    if [[ -z "$instance" || "$instance" == "null" ]]; then
+        echo -e "${RED}Error: Instance not found: $instance_name${NC}"
+        exit 1
+    fi
+
+    local instance_id state shape created
+    instance_id=$(echo "$instance" | jq -r '.id')
+    state=$(echo "$instance" | jq -r '."lifecycle-state"')
+    shape=$(echo "$instance" | jq -r '.shape')
+    created=$(echo "$instance" | jq -r '."time-created"')
+
+    # Get IP
+    local ip="none"
+    local vnic_id
+    vnic_id=$(oci_cmd compute vnic-attachment list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --instance-id "$instance_id" \
+        --query 'data[0]."vnic-id"' --raw-output 2>/dev/null)
+
+    if [[ -n "$vnic_id" && "$vnic_id" != "null" ]]; then
+        ip=$(oci_cmd network vnic get \
+            --vnic-id "$vnic_id" \
+            --query 'data."public-ip"' --raw-output 2>/dev/null || echo "none")
+    fi
+
+    # Color status
+    local state_color
+    case "$state" in
+        RUNNING)     state_color="${GREEN}${state}${NC}" ;;
+        STOPPED)     state_color="${RED}${state}${NC}" ;;
+        TERMINATED)  state_color="${RED}${state}${NC}" ;;
+        *)           state_color="${YELLOW}${state}${NC}" ;;
+    esac
+
+    echo -e "${CYAN}$instance_name${NC}"
+    echo -e "  State:    $state_color"
+    echo -e "  IP:       $ip"
+    echo -e "  Shape:    $shape"
+    echo -e "  ID:       ${instance_id##*.}..."
+    echo -e "  Created:  $created"
+}
+
+cmd_reboot() {
+    local instance_id=$1
+
+    if [[ -z "$instance_id" ]]; then
+        echo -e "${RED}Error: Instance ID required${NC}"
+        echo "Usage: $0 reboot <ocid>"
+        exit 1
+    fi
+
+    # Get instance info
+    local instance_info
+    instance_info=$(oci_cmd compute instance get --instance-id "$instance_id" --query 'data' --output json)
+    local instance_name
+    instance_name=$(echo "$instance_info" | jq -r '."display-name"')
+
+    echo -e "${YELLOW}Rebooting instance '$instance_name'${NC}"
+    echo "Instance ID: ${instance_id##*.}..."
+
+    if ! confirm_action "Proceed?"; then
+        echo "Reboot cancelled"
+        exit 0
+    fi
+
+    echo "Rebooting (SOFTRESET)..."
+    oci_cmd compute instance action \
+        --instance-id "$instance_id" \
+        --action SOFTRESET \
+        --wait-for-state RUNNING > /dev/null
+
+    echo -e "${GREEN}Reboot complete - instance is running${NC}"
+}
+
+cmd_power_on() {
+    local instance_id=$1
+
+    if [[ -z "$instance_id" ]]; then
+        echo -e "${RED}Error: Instance ID required${NC}"
+        echo "Usage: $0 power-on <ocid>"
+        exit 1
+    fi
+
+    # Get instance info
+    local instance_info
+    instance_info=$(oci_cmd compute instance get --instance-id "$instance_id" --query 'data' --output json)
+    local instance_name
+    instance_name=$(echo "$instance_info" | jq -r '."display-name"')
+
+    echo -e "${YELLOW}Starting instance '$instance_name'${NC}"
+    echo "Instance ID: ${instance_id##*.}..."
+
+    if ! confirm_action "Proceed?"; then
+        echo "Start cancelled"
+        exit 0
+    fi
+
+    echo "Starting..."
+    oci_cmd compute instance action \
+        --instance-id "$instance_id" \
+        --action START \
+        --wait-for-state RUNNING > /dev/null
+
+    echo -e "${GREEN}Instance started${NC}"
+}
+
+cmd_console() {
+    local instance_id=$1
+
+    if [[ -z "$instance_id" ]]; then
+        echo -e "${RED}Error: Instance ID required${NC}"
+        echo "Usage: $0 console <ocid>"
+        exit 1
+    fi
+
+    # Get instance info
+    local instance_info
+    instance_info=$(oci_cmd compute instance get --instance-id "$instance_id" --query 'data' --output json)
+    local instance_name
+    instance_name=$(echo "$instance_info" | jq -r '."display-name"')
+
+    echo -e "${CYAN}Creating serial console connection for '$instance_name'...${NC}"
+
+    # Check for existing active connection
+    local existing
+    existing=$(oci_cmd compute instance-console-connection list \
+        --compartment-id "$OCI_COMPARTMENT_ID" \
+        --instance-id "$instance_id" \
+        --all \
+        --query "data[?\"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output 2>/dev/null)
+
+    local connection_id
+    if [[ -n "$existing" && "$existing" != "null" ]]; then
+        echo "Using existing console connection..."
+        connection_id="$existing"
+    else
+        # Get SSH public key
+        local ssh_key_file
+        if [[ -f "$HOME/.ssh/id_ed25519.pub" ]]; then
+            ssh_key_file="$HOME/.ssh/id_ed25519.pub"
+        elif [[ -f "$HOME/.ssh/id_rsa.pub" ]]; then
+            ssh_key_file="$HOME/.ssh/id_rsa.pub"
+        else
+            echo -e "${RED}Error: No SSH public key found (~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub)${NC}"
+            exit 1
+        fi
+
+        echo "Creating new console connection..."
+        # Create console connection
+        connection_id=$(oci_cmd compute instance-console-connection create \
+            --instance-id "$instance_id" \
+            --ssh-public-key-file "$ssh_key_file" \
+            --wait-for-state ACTIVE \
+            --query 'data.id' --raw-output 2>&1)
+
+        if [[ "$connection_id" == *"error"* || -z "$connection_id" || "$connection_id" == "null" ]]; then
+            echo -e "${RED}Error: Failed to create console connection${NC}"
+            echo "$connection_id"
+            exit 1
+        fi
+    fi
+
+    # Get connection details
+    local connection
+    connection=$(oci_cmd compute instance-console-connection get \
+        --instance-console-connection-id "$connection_id" \
+        --query 'data' --output json)
+
+    local ssh_command vnc_command
+    ssh_command=$(echo "$connection" | jq -r '."connection-string" // empty')
+    vnc_command=$(echo "$connection" | jq -r '."vnc-connection-string" // empty')
+
+    echo ""
+    echo -e "${GREEN}Serial Console Connection Ready${NC}"
+    echo ""
+    echo -e "${BLUE}SSH Serial Console:${NC}"
+    echo "$ssh_command"
+    echo ""
+    if [[ -n "$vnc_command" && "$vnc_command" != "null" && "$vnc_command" != "empty" ]]; then
+        echo -e "${BLUE}VNC Console:${NC}"
+        echo "$vnc_command"
+        echo ""
+    fi
+    echo "Connection ID: ${connection_id##*.}..."
+    echo ""
+    echo "To connect: Copy and run the SSH command above"
+    echo "To delete:  oci compute instance-console-connection delete --instance-console-connection-id $connection_id --force"
+}
+
+cmd_power_off() {
+    local instance_id=$1
+
+    if [[ -z "$instance_id" ]]; then
+        echo -e "${RED}Error: Instance ID required${NC}"
+        echo "Usage: $0 power-off <ocid>"
+        exit 1
+    fi
+
+    # Get instance info
+    local instance_info
+    instance_info=$(oci_cmd compute instance get --instance-id "$instance_id" --query 'data' --output json)
+    local instance_name
+    instance_name=$(echo "$instance_info" | jq -r '."display-name"')
+
+    echo -e "${YELLOW}Warning: Stopping instance '$instance_name'${NC}"
+    echo "Instance ID: ${instance_id##*.}..."
+    echo "This is a graceful stop. Use SOFTSTOP for quicker shutdown."
+
+    if ! confirm_action "Proceed?"; then
+        echo "Stop cancelled"
+        exit 0
+    fi
+
+    echo "Stopping..."
+    oci_cmd compute instance action \
+        --instance-id "$instance_id" \
+        --action STOP \
+        --wait-for-state STOPPED > /dev/null
+
+    echo -e "${GREEN}Instance stopped${NC}"
+}
+
+# Main
+main() {
+    parse_global_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+
+    local cmd=${1:-}
+
+    if [[ -z "$cmd" ]]; then
+        usage "$0"
+    fi
+
+    load_config
+
+    case "$cmd" in
+        list-instances)  cmd_list_instances ;;
+        list-vcns)       cmd_list_vcns ;;
+        list-subnets)    cmd_list_subnets ;;
+        list-security)   cmd_list_security ;;
+        list-shapes)     cmd_list_shapes ;;
+        list-images)     cmd_list_images ;;
+        list-all)        cmd_list_all ;;
+        get-instance)    cmd_get_instance "${2:-}" ;;
+        create-network)  shift; cmd_create_network "$@" ;;
+        create-instance) cmd_create_instance "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
+        delete-instance) cmd_delete_instance "${2:-}" ;;
+        delete-network)  cmd_delete_network "${2:-}" ;;
+        get-limits)      cmd_get_limits ;;
+        get-costs)       cmd_get_costs ;;
+        ssh)             shift; cmd_ssh "$@" ;;
+        status)          cmd_status "${2:-}" ;;
+        console)         cmd_console "${2:-}" ;;
+        reboot)          cmd_reboot "${2:-}" ;;
+        power-on)        cmd_power_on "${2:-}" ;;
+        power-off)       cmd_power_off "${2:-}" ;;
+        -h|--help|help)  usage "$0" ;;
+        *)
+            echo -e "${RED}Unknown command: $cmd${NC}"
+            usage "$0"
+            ;;
+    esac
+}
+
+main "$@"
