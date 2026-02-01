@@ -21,6 +21,7 @@
 #
 #   create-firewall <name> <ports>  Create firewall with specified ports
 #   apply-firewall <fw-id> <srv-id> Apply firewall to a server
+#   get-firewall <id|name>  Show firewall rules
 #   delete-firewall <id>            Delete a firewall
 #
 #   get-costs          Show current costs
@@ -728,6 +729,61 @@ cmd_delete_firewall() {
     echo -e "${GREEN}Firewall deleted${NC}"
 }
 
+cmd_get_firewall() {
+    local fw_ref=${1:-}
+
+    if [[ -z "$fw_ref" ]]; then
+        echo -e "${RED}Error: Firewall ID or name required${NC}"
+        echo "Usage: $0 get-firewall <id-or-name>"
+        exit 1
+    fi
+
+    # Try by ID first, then by name
+    local response
+    if [[ "$fw_ref" =~ ^[0-9]+$ ]]; then
+        response=$(api GET "/firewalls/$fw_ref")
+    else
+        response=$(api GET "/firewalls?name=$fw_ref")
+        response=$(echo "$response" | jq '{firewall: .firewalls[0]}')
+    fi
+
+    local fw_name fw_id
+    fw_name=$(echo "$response" | jq -r '.firewall.name // empty')
+
+    if [[ -z "$fw_name" ]]; then
+        echo -e "${RED}Error: Firewall not found: $fw_ref${NC}"
+        exit 1
+    fi
+
+    fw_id=$(echo "$response" | jq -r '.firewall.id')
+
+    echo -e "${CYAN}=== Firewall: $fw_name (ID: $fw_id) ===${NC}"
+
+    local applied_count
+    applied_count=$(echo "$response" | jq '.firewall.applied_to | length')
+    echo -e "Applied to: $applied_count server(s)"
+
+    echo ""
+    echo -e "${BLUE}Inbound Rules:${NC}"
+    local in_rules
+    in_rules=$(echo "$response" | jq -r '.firewall.rules[] | select(.direction == "in") | "\(.protocol)\t\(.port // "-")\t\(.source_ips | join(","))\t\(.description // "-")"')
+    if [[ -z "$in_rules" ]]; then
+        echo "  (none — all inbound traffic denied)"
+    else
+        echo "$in_rules" | column -t -s $'\t' -N "PROTO,PORT,SOURCE,DESC"
+    fi
+
+    echo ""
+    echo -e "${BLUE}Outbound Rules:${NC}"
+    local out_rules
+    out_rules=$(echo "$response" | jq -r '.firewall.rules[] | select(.direction == "out") | "\(.protocol)\t\(.port // "-")\t\(.destination_ips | join(","))\t\(.description // "-")"')
+    if [[ -z "$out_rules" ]]; then
+        echo "  (none — all outbound traffic allowed)"
+    else
+        echo "$out_rules" | column -t -s $'\t' -N "PROTO,PORT,DESTINATION,DESC"
+    fi
+}
+
 # Main
 main() {
     parse_global_flags "$@"
@@ -756,6 +812,7 @@ main() {
         create-firewall) cmd_create_firewall "${2:-}" "${3:-}" ;;
         apply-firewall)  cmd_apply_firewall "${2:-}" "${3:-}" ;;
         delete-firewall) cmd_delete_firewall "${2:-}" ;;
+        get-firewall)    cmd_get_firewall "${2:-}" ;;
         get-costs)       cmd_get_costs ;;
         ssh)             shift; cmd_ssh "$@" ;;
         status)          cmd_status "${2:-}" ;;
