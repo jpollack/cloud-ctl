@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+#
+# Porkbun Domain Management CLI
+# Simple primitives for managing domains and DNS via Porkbun API
+#
+# Usage: porkbun-ctl <command> [args...]
+#
+# Commands:
+#   ping                    Test API credentials
+#
+#   check <domain>          Check single domain availability
+#   search <name> [tlds...] Check name across multiple TLDs (default: xyz,com,net,org,io)
+#   pricing [tld]           Show pricing for TLDs (or specific TLD)
+#
+#   register <domain>       Register a domain (interactive confirmation)
+#   list-domains            List all domains in account
+#
+#   list-records <domain>   List DNS records for domain
+#   set-a <domain> <name> <ip>      Create/update A record (@ for root)
+#   set-aaaa <domain> <name> <ip>   Create/update AAAA record
+#   set-cname <domain> <name> <target>  Create/update CNAME record
+#   set-txt <domain> <name> <value>     Create/update TXT record
+#   delete-record <domain> <id>         Delete record by ID
+#
+#   set-ns <domain> <ns1> <ns2> [ns3...]  Update nameservers
+#   get-ns <domain>                       Get current nameservers
+#
+#   enable-api <domain>     Enable API access for domain (after registration)
+#
+# Options:
+#   -y, --yes               Skip confirmation prompts (for scripting)
+#
+# Environment:
+#   PORKBUN_API_KEY         API key (or ~/.porkbun/api_key)
+#   PORKBUN_SECRET_KEY      Secret key (or ~/.porkbun/secret_key)
+#
+# Rate Limits:
+#   Domain checks: 1 per 10 seconds
+#   Other calls: More lenient but be respectful
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+API_BASE="https://api.porkbun.com/api/json/v3"
+
+# Default TLDs for search
+DEFAULT_TLDS="xyz,com,net,org,io,dev,site"
+
+# Load credentials
+load_credentials() {
+    if ! load_credential "PORKBUN_API_KEY" "$HOME/.porkbun/api_key"; then
+        echo -e "${RED}Error: No API key found${NC}"
+        echo "Set PORKBUN_API_KEY or create ~/.porkbun/api_key"
+        exit 1
+    fi
+    if ! load_credential "PORKBUN_SECRET_KEY" "$HOME/.porkbun/secret_key"; then
+        echo -e "${RED}Error: No secret key found${NC}"
+        echo "Set PORKBUN_SECRET_KEY or create ~/.porkbun/secret_key"
+        exit 1
+    fi
+}
+
+# API request helper
+api() {
+    local endpoint=$1
+    local extra_data=${2:-}
+
+    local auth_data="{\"apikey\": \"${PORKBUN_API_KEY}\", \"secretapikey\": \"${PORKBUN_SECRET_KEY}\""
+
+    if [[ -n "$extra_data" ]]; then
+        # Merge extra data into auth data
+        local data="${auth_data}, ${extra_data}}"
+    else
+        local data="${auth_data}}"
+    fi
+
+    curl -s "${API_BASE}${endpoint}" \
+        -H "Content-Type: application/json" \
+        -d "$data"
+}
+
+# Commands
+cmd_ping() {
+    echo -e "${CYAN}=== Testing API Credentials ===${NC}"
+    local response
+    response=$(api "/ping")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" == "SUCCESS" ]]; then
+        local ip
+        ip=$(echo "$response" | jq -r '.yourIp')
+        echo -e "${GREEN}✓ API credentials valid${NC}"
+        echo "  Your IP: $ip"
+    else
+        echo -e "${RED}✗ API credentials invalid${NC}"
+        echo "$response" | jq '.'
+        exit 1
+    fi
+}
+
+cmd_check() {
+    local domain=$1
+
+    if [[ -z "$domain" ]]; then
+        echo -e "${RED}Error: Domain required${NC}"
+        echo "Usage: $0 check <domain>"
+        exit 1
+    fi
+
+    local response
+    response=$(api "/domain/checkDomain/$domain")
+
+    local status avail price renewal premium
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" != "SUCCESS" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    avail=$(echo "$response" | jq -r '.response.avail')
+    price=$(echo "$response" | jq -r '.response.price')
+    renewal=$(echo "$response" | jq -r '.response.additional.renewal.price')
+    premium=$(echo "$response" | jq -r '.response.premium')
+
+    if [[ "$avail" == "yes" ]]; then
+        echo -e "${GREEN}✓ $domain is available${NC}"
+        echo "  Registration: \$$price"
+        echo "  Renewal:      \$$renewal/year"
+        if [[ "$premium" == "yes" ]]; then
+            echo -e "  ${YELLOW}(Premium domain)${NC}"
+        fi
+    else
+        echo -e "${RED}✗ $domain is not available${NC}"
+    fi
+}
+
+cmd_search() {
+    local name=$1
+    shift || true
+
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Error: Name required${NC}"
+        echo "Usage: $0 search <name> [tlds...]"
+        echo "Example: $0 search mysite xyz com net"
+        exit 1
+    fi
+
+    # Get TLDs from args or use defaults
+    local tlds
+    if [[ $# -gt 0 ]]; then
+        tlds=("$@")
+    else
+        IFS=',' read -ra tlds <<< "$DEFAULT_TLDS"
+    fi
+
+    echo -e "${CYAN}=== Searching '$name' across ${#tlds[@]} TLDs ===${NC}"
+    echo -e "${YELLOW}Note: Rate limited to 1 check per 10 seconds${NC}"
+    echo ""
+
+    local found_available=false
+
+    for tld in "${tlds[@]}"; do
+        local domain="${name}.${tld}"
+        echo -n "  $domain: "
+
+        local response
+        response=$(api "/domain/checkDomain/$domain")
+
+        local status avail price renewal
+        status=$(echo "$response" | jq -r '.status')
+
+        if [[ "$status" != "SUCCESS" ]]; then
+            echo -e "${YELLOW}? Error${NC}"
+        else
+            avail=$(echo "$response" | jq -r '.response.avail')
+            price=$(echo "$response" | jq -r '.response.price')
+            renewal=$(echo "$response" | jq -r '.response.additional.renewal.price')
+
+            if [[ "$avail" == "yes" ]]; then
+                echo -e "${GREEN}✓ Available${NC} - \$$price first year, \$$renewal/yr"
+                found_available=true
+            else
+                echo -e "${RED}✗ Taken${NC}"
+            fi
+        fi
+
+        # Rate limit delay (skip after last one)
+        if [[ "$tld" != "${tlds[-1]}" ]]; then
+            sleep 10
+        fi
+    done
+
+    echo ""
+    if [[ "$found_available" == "true" ]]; then
+        echo "To register: $0 register <domain>"
+    else
+        echo "No available domains found. Try different name or TLDs."
+    fi
+}
+
+cmd_pricing() {
+    local tld=${1:-}
+
+    echo -e "${CYAN}=== Domain Pricing ===${NC}"
+
+    local response
+    response=$(api "/pricing/get")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" != "SUCCESS" ]]; then
+        echo -e "${RED}Error fetching pricing${NC}"
+        exit 1
+    fi
+
+    if [[ -n "$tld" ]]; then
+        # Show specific TLD
+        echo "$response" | jq -r ".pricing.\"$tld\" // empty | \"$tld: Registration \(.registration), Renewal \(.renewal)\""
+    else
+        # Show common TLDs
+        echo -e "\n${BLUE}Common TLDs:${NC}"
+        echo "$response" | jq -r '
+            .pricing | to_entries |
+            map(select(.key | test("^(com|net|org|xyz|io|dev|site|online|app|co)$"))) |
+            sort_by(.value.registration | tonumber) |
+            .[] | "\(.key)\t$\(.value.registration)\t$\(.value.renewal)/yr"
+        ' | column -t -s $'\t' -N "TLD,REGISTER,RENEW"
+
+        echo -e "\n${BLUE}Cheap TLDs (<\$5 registration):${NC}"
+        echo "$response" | jq -r '
+            .pricing | to_entries |
+            map(select(.value.registration | tonumber < 5)) |
+            sort_by(.value.registration | tonumber) |
+            limit(15; .[]) | "\(.key)\t$\(.value.registration)\t$\(.value.renewal)/yr"
+        ' | column -t -s $'\t' -N "TLD,REGISTER,RENEW"
+    fi
+}
+
+cmd_register() {
+    local domain=$1
+
+    if [[ -z "$domain" ]]; then
+        echo -e "${RED}Error: Domain required${NC}"
+        echo "Usage: $0 register <domain>"
+        exit 1
+    fi
+
+    # First check availability and get price
+    echo "Checking $domain..."
+    local check_response
+    check_response=$(api "/domain/checkDomain/$domain")
+
+    local status avail price
+    status=$(echo "$check_response" | jq -r '.status')
+
+    if [[ "$status" != "SUCCESS" ]]; then
+        echo -e "${RED}Error: $(echo "$check_response" | jq -r '.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    avail=$(echo "$check_response" | jq -r '.response.avail')
+    price=$(echo "$check_response" | jq -r '.response.price')
+
+    if [[ "$avail" != "yes" ]]; then
+        echo -e "${RED}Error: $domain is not available${NC}"
+        exit 1
+    fi
+
+    # Convert price to cents for API
+    local price_cents
+    price_cents=$(echo "$price * 100" | bc | cut -d. -f1)
+
+    echo ""
+    echo -e "Domain:  ${GREEN}$domain${NC}"
+    echo -e "Price:   \$$price"
+    echo ""
+
+    if ! confirm_action "Register this domain?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    echo "Registering..."
+    local response
+    # Note: cost must be passed as integer (no quotes in JSON)
+    response=$(api "/domain/create/$domain" "\"cost\": $price_cents, \"agreeToTerms\": \"yes\"")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" == "SUCCESS" ]]; then
+        echo -e "${GREEN}✓ Domain registered successfully!${NC}"
+        echo ""
+        echo "Next steps:"
+        echo "  1. Enable API access: $0 enable-api $domain"
+        echo "  2. Set DNS records:   $0 set-a $domain @ <your-ip>"
+    else
+        echo -e "${RED}Error registering domain:${NC}"
+        echo "$response" | jq '.'
+        exit 1
+    fi
+}
+
+cmd_list_domains() {
+    echo -e "${CYAN}=== Your Domains ===${NC}"
+
+    local response
+    response=$(api "/domain/listAll")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" != "SUCCESS" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    local count
+    count=$(echo "$response" | jq '.domains | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo "No domains found"
+        return
+    fi
+
+    echo "$response" | jq -r '.domains[] | "\(.domain)\t\(.status)\tExpires: \(.expireDate)"' | \
+        column -t -s $'\t' -N "DOMAIN,STATUS,EXPIRES"
+}
+
+cmd_list_records() {
+    local domain=$1
+
+    if [[ -z "$domain" ]]; then
+        echo -e "${RED}Error: Domain required${NC}"
+        echo "Usage: $0 list-records <domain>"
+        exit 1
+    fi
+
+    echo -e "${CYAN}=== DNS Records for $domain ===${NC}"
+
+    local response
+    response=$(api "/dns/retrieve/$domain")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" != "SUCCESS" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    local count
+    count=$(echo "$response" | jq '.records | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo "No DNS records found"
+        return
+    fi
+
+    echo "$response" | jq -r '.records[] | "\(.id)\t\(.type)\t\(.name)\t\(.content)\tTTL:\(.ttl)"' | \
+        column -t -s $'\t' -N "ID,TYPE,NAME,VALUE,TTL"
+}
+
+cmd_set_record() {
+    local type=$1
+    local domain=$2
+    local name=$3
+    local content=$4
+    local ttl=${5:-600}
+
+    if [[ -z "$domain" || -z "$name" || -z "$content" ]]; then
+        echo -e "${RED}Error: Missing arguments${NC}"
+        echo "Usage: $0 set-$type <domain> <name> <value> [ttl]"
+        exit 1
+    fi
+
+    # Convert @ to empty string for root
+    if [[ "$name" == "@" ]]; then
+        name=""
+    fi
+
+    echo "Setting $type record: $name.$domain -> $content"
+
+    # First try to find existing record to update
+    local existing
+    existing=$(api "/dns/retrieve/$domain")
+
+    local record_id
+    if [[ -n "$name" ]]; then
+        record_id=$(echo "$existing" | jq -r ".records[] | select(.type == \"$type\" and .name == \"$name.$domain\") | .id" | head -1)
+    else
+        record_id=$(echo "$existing" | jq -r ".records[] | select(.type == \"$type\" and .name == \"$domain\") | .id" | head -1)
+    fi
+
+    local response
+    if [[ -n "$record_id" && "$record_id" != "null" ]]; then
+        # Update existing
+        echo "Updating existing record (ID: $record_id)..."
+        response=$(api "/dns/edit/$domain/$record_id" "\"name\": \"$name\", \"type\": \"$type\", \"content\": \"$content\", \"ttl\": \"$ttl\"")
+    else
+        # Create new
+        echo "Creating new record..."
+        response=$(api "/dns/create/$domain" "\"name\": \"$name\", \"type\": \"$type\", \"content\": \"$content\", \"ttl\": \"$ttl\"")
+    fi
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" == "SUCCESS" ]]; then
+        echo -e "${GREEN}✓ Record set successfully${NC}"
+    else
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+}
+
+cmd_delete_record() {
+    local domain=$1
+    local record_id=$2
+
+    if [[ -z "$domain" || -z "$record_id" ]]; then
+        echo -e "${RED}Error: Domain and record ID required${NC}"
+        echo "Usage: $0 delete-record <domain> <record-id>"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}Deleting record $record_id from $domain${NC}"
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api "/dns/delete/$domain/$record_id")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" == "SUCCESS" ]]; then
+        echo -e "${GREEN}✓ Record deleted${NC}"
+    else
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+}
+
+cmd_get_ns() {
+    local domain=$1
+
+    if [[ -z "$domain" ]]; then
+        echo -e "${RED}Error: Domain required${NC}"
+        echo "Usage: $0 get-ns <domain>"
+        exit 1
+    fi
+
+    echo -e "${CYAN}=== Nameservers for $domain ===${NC}"
+
+    local response
+    response=$(api "/domain/getNs/$domain")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" != "SUCCESS" ]]; then
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+
+    echo "$response" | jq -r '.ns[]'
+}
+
+cmd_set_ns() {
+    local domain=$1
+    shift || true
+
+    if [[ -z "$domain" || $# -lt 2 ]]; then
+        echo -e "${RED}Error: Domain and at least 2 nameservers required${NC}"
+        echo "Usage: $0 set-ns <domain> <ns1> <ns2> [ns3...]"
+        exit 1
+    fi
+
+    local ns_array
+    ns_array=$(printf '%s\n' "$@" | jq -R . | jq -s .)
+
+    echo "Setting nameservers for $domain:"
+    printf '  %s\n' "$@"
+    echo ""
+
+    if ! confirm_action "Proceed?"; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    local response
+    response=$(api "/domain/updateNs/$domain" "\"ns\": $ns_array")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" == "SUCCESS" ]]; then
+        echo -e "${GREEN}✓ Nameservers updated${NC}"
+    else
+        echo -e "${RED}Error: $(echo "$response" | jq -r '.message // "Unknown error"')${NC}"
+        exit 1
+    fi
+}
+
+cmd_enable_api() {
+    local domain=$1
+
+    if [[ -z "$domain" ]]; then
+        echo -e "${RED}Error: Domain required${NC}"
+        echo "Usage: $0 enable-api <domain>"
+        exit 1
+    fi
+
+    echo "Enabling API access for $domain..."
+
+    # Note: This might not be available via API - may need to be done via dashboard
+    # Attempting the call anyway
+    local response
+    response=$(api "/domain/enableApiAccess/$domain")
+
+    local status
+    status=$(echo "$response" | jq -r '.status')
+
+    if [[ "$status" == "SUCCESS" ]]; then
+        echo -e "${GREEN}✓ API access enabled${NC}"
+    else
+        echo -e "${YELLOW}Note: You may need to enable API access via the Porkbun dashboard${NC}"
+        echo "  1. Go to porkbun.com > Domain Management"
+        echo "  2. Click Details on $domain"
+        echo "  3. Toggle 'API Access' to enabled"
+    fi
+}
+
+# Main
+main() {
+    parse_global_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+
+    local cmd=${1:-}
+
+    if [[ -z "$cmd" ]]; then
+        usage "$0"
+    fi
+
+    load_credentials
+
+    case "$cmd" in
+        ping)           cmd_ping ;;
+        check)          cmd_check "${2:-}" ;;
+        search)         shift; cmd_search "$@" ;;
+        pricing)        cmd_pricing "${2:-}" ;;
+        register)       cmd_register "${2:-}" ;;
+        list-domains)   cmd_list_domains ;;
+        list-records)   cmd_list_records "${2:-}" ;;
+        set-a)          cmd_set_record "A" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        set-aaaa)       cmd_set_record "AAAA" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        set-cname)      cmd_set_record "CNAME" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        set-txt)        cmd_set_record "TXT" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        delete-record)  cmd_delete_record "${2:-}" "${3:-}" ;;
+        get-ns)         cmd_get_ns "${2:-}" ;;
+        set-ns)         shift; cmd_set_ns "$@" ;;
+        enable-api)     cmd_enable_api "${2:-}" ;;
+        -h|--help|help) usage "$0" ;;
+        *)
+            echo -e "${RED}Unknown command: $cmd${NC}"
+            usage "$0"
+            ;;
+    esac
+}
+
+main "$@"
